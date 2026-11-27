@@ -58,19 +58,33 @@ struct ContentView: View {
                     .disabled(model.isConnecting)
 
                     if model.isConnected {
-                        Button {
-                            model.toggleMicrophone()
-                        } label: {
-                            Label(model.isMicActive ? "停止麦克风回传" : "将 iPhone 麦克风回传到电脑",
-                                  systemImage: model.isMicActive ? "mic.slash.fill" : "mic.fill")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 14)
-                                .background(Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
+                        VStack(spacing: 10) {
+                            Button {
+                                model.toggleMicrophone()
+                            } label: {
+                                Label(model.isMicActive ? "停止麦克风回传" : "将 iPhone 麦克风回传到电脑",
+                                      systemImage: model.isMicActive ? "mic.slash.fill" : "mic.fill")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 14)
+                                    .background(
+                                        model.isMicActive ? Color.green.opacity(0.28) : Color.white.opacity(0.1),
+                                        in: RoundedRectangle(cornerRadius: 14)
+                                    )
+                            }
+                            .disabled(!model.micAvailable && !model.isMicActive)
+                            .opacity(model.micAvailable || model.isMicActive ? 1 : 0.45)
+
+                            if model.micAvailable || model.isMicActive {
+                                Picker("麦克风音源", selection: $model.micSourceMode) {
+                                    ForEach(MicSourceMode.allCases) { mode in
+                                        Text(mode.title).tag(mode)
+                                    }
+                                }
+                                .pickerStyle(.segmented)
+                            }
                         }
-                        .disabled(!model.micAvailable && !model.isMicActive)
-                        .opacity(model.micAvailable || model.isMicActive ? 1 : 0.45)
                     }
                 }
 

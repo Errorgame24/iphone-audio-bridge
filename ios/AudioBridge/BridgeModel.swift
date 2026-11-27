@@ -22,9 +22,35 @@ private struct PendingTrust {
     let completion: (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
 }
 
+enum MicSourceMode: String, CaseIterable, Identifiable {
+    case builtInKeepStereo = "builtIn"
+    case headsetBluetooth = "headset"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .builtInKeepStereo:
+            return "手机内置麦 (保真立体声)"
+        case .headsetBluetooth:
+            return "耳机/系统麦 (蓝牙通话)"
+        }
+    }
+}
+
 final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSessionTaskDelegate {
     @Published var serverAddress = UserDefaults.standard.string(forKey: "serverAddress") ?? "" {
         didSet { UserDefaults.standard.set(serverAddress, forKey: "serverAddress") }
+    }
+    @Published var micSourceMode: MicSourceMode = MicSourceMode(
+        rawValue: UserDefaults.standard.string(forKey: "micSourceMode") ?? ""
+    ) ?? .builtInKeepStereo {
+        didSet {
+            UserDefaults.standard.set(micSourceMode.rawValue, forKey: "micSourceMode")
+            if isMicActive {
+                Task { @MainActor in await applyMicSourceChange() }
+            }
+        }
     }
     @Published private(set) var status = "输入电脑上显示的 HTTPS 地址，然后连接。"
     @Published private(set) var isConnected = false
@@ -43,8 +69,9 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
     private var micSendTask: Task<Void, Never>?
     private var micContinuation: AsyncStream<Data>.Continuation?
     private var engine: AVAudioEngine?
+    private var engineConfigObserver: NSObjectProtocol?
+    private var routeRebuildTask: Task<Void, Never>?
     private var pcmBuffer: PCMBuffer?
-    private var micConverter: AVAudioConverter?
     private var micTapInstalled = false
     private var serverConfig: ServerConfig?
     private var pendingTrust: PendingTrust?
@@ -113,7 +140,16 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
             sampleRate = config.sampleRate
             micAvailable = config.micAvailable ?? false
 
-            let buffer = try startPlayer(sampleRate: config.sampleRate)
+            let buffer = PCMBuffer(
+                capacity: max(2_048, config.sampleRate / 6),
+                prebufferFrames: max(512, config.sampleRate / 30)
+            )
+            pcmBuffer = buffer
+            _ = try rebuildAudioEngine(
+                playerSampleRate: config.sampleRate,
+                buffer: buffer,
+                micTarget: nil
+            )
 
             let socket = urlSession.webSocketTask(with: endpoint("audio", baseURL: baseURL, secureWebSocket: true))
             audioSocket = socket
@@ -164,20 +200,24 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
     }
 
     @MainActor
-    private func startPlayer(sampleRate: Int) throws -> PCMBuffer {
-        let audioSession = AVAudioSession.sharedInstance()
-        try audioSession.setCategory(.playback, mode: .default)
-        try? audioSession.setPreferredSampleRate(Double(sampleRate))
-        try? audioSession.setPreferredIOBufferDuration(0.01)
-        try audioSession.setActive(true)
+    private func teardownEngineOnly() {
+        if let engineConfigObserver {
+            NotificationCenter.default.removeObserver(engineConfigObserver)
+            self.engineConfigObserver = nil
+        }
+        if micTapInstalled {
+            engine?.inputNode.removeTap(onBus: 0)
+            micTapInstalled = false
+        }
+        engine?.stop()
+        engine = nil
+    }
 
-        let audioEngine = AVAudioEngine()
-        let buffer = PCMBuffer(
-            capacity: max(2_048, sampleRate / 6),
-            prebufferFrames: max(512, sampleRate / 30)
-        )
-        let format = AVAudioFormat(standardFormatWithSampleRate: Double(sampleRate), channels: 2)!
-        let source = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList -> OSStatus in
+    nonisolated private static func makePlaybackSourceNode(
+        format: AVAudioFormat,
+        buffer: PCMBuffer
+    ) -> AVAudioSourceNode {
+        AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList -> OSStatus in
             let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
             guard buffers.count >= 2,
                   let left = buffers[0].mData?.assumingMemoryBound(to: Float.self),
@@ -187,14 +227,268 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
             buffer.render(left: left, right: right, frameCount: Int(frameCount))
             return noErr
         }
+    }
 
+    nonisolated private static func installMicrophoneTap(
+        on input: AVAudioInputNode,
+        targetRate: Int,
+        targetChannels: Int,
+        continuation: AsyncStream<Data>.Continuation
+    ) {
+        var cachedConverter: AVAudioConverter?
+        var cachedSourceRate: Double = 0
+        var cachedSourceChannels: AVAudioChannelCount = 0
+
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1024, format: nil) { incoming, _ in
+            guard incoming.frameLength > 0 else { return }
+            let srcFormat = incoming.format
+            guard srcFormat.sampleRate > 0, srcFormat.channelCount > 0 else { return }
+
+            let pcmBuf: AVAudioPCMBuffer
+            if abs(srcFormat.sampleRate - Double(targetRate)) > 0.5 {
+                if cachedConverter == nil
+                    || abs(cachedSourceRate - srcFormat.sampleRate) > 0.5
+                    || cachedSourceChannels != srcFormat.channelCount {
+                    guard let dstFormat = AVAudioFormat(
+                        standardFormatWithSampleRate: Double(targetRate),
+                        channels: srcFormat.channelCount
+                    ) else { return }
+                    cachedConverter = AVAudioConverter(from: srcFormat, to: dstFormat)
+                    cachedSourceRate = srcFormat.sampleRate
+                    cachedSourceChannels = srcFormat.channelCount
+                }
+                guard let converter = cachedConverter else { return }
+                let dstFormat = converter.outputFormat
+                let ratio = dstFormat.sampleRate / srcFormat.sampleRate
+                let cap = AVAudioFrameCount(Double(incoming.frameLength) * ratio + 64)
+                guard let converted = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: max(64, cap)) else {
+                    return
+                }
+                var providedInput = false
+                var conversionError: NSError?
+                let res = converter.convert(to: converted, error: &conversionError) { _, inputStatus in
+                    if providedInput {
+                        inputStatus.pointee = .noDataNow
+                        return nil
+                    }
+                    providedInput = true
+                    inputStatus.pointee = .haveData
+                    return incoming
+                }
+                guard res != .error, converted.frameLength > 0 else { return }
+                pcmBuf = converted
+            } else {
+                pcmBuf = incoming
+            }
+
+            guard let floatChannels = pcmBuf.floatChannelData else { return }
+            let leftPtr = UnsafePointer(floatChannels[0])
+            let rightPtr: UnsafePointer<Float>? = pcmBuf.format.channelCount > 1
+                ? UnsafePointer(floatChannels[1])
+                : nil
+            let packet = PCMMicEncoder.encodeInterleavedInt16(
+                left: leftPtr,
+                right: rightPtr,
+                frameCount: Int(pcmBuf.frameLength),
+                targetChannels: targetChannels
+            )
+            if !packet.isEmpty {
+                continuation.yield(packet)
+            }
+        }
+    }
+
+    @MainActor
+    private func rebuildAudioEngine(
+        playerSampleRate: Int,
+        buffer: PCMBuffer,
+        micTarget: (rate: Int, channels: Int, continuation: AsyncStream<Data>.Continuation)?
+    ) throws -> Int? {
+        teardownEngineOnly()
+
+        let audioSession = AVAudioSession.sharedInstance()
+        if micTarget != nil {
+            let options: AVAudioSession.CategoryOptions = micSourceMode == .builtInKeepStereo
+                ? [.defaultToSpeaker, .allowBluetoothA2DP]
+                : [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
+            try audioSession.setCategory(.playAndRecord, mode: .default, options: options)
+            try? audioSession.setPreferredSampleRate(Double(playerSampleRate))
+            try? audioSession.setPreferredIOBufferDuration(0.01)
+            try audioSession.setActive(true)
+
+            if micSourceMode == .builtInKeepStereo,
+               let builtIn = audioSession.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+                try? audioSession.setPreferredInput(builtIn)
+            } else {
+                try? audioSession.setPreferredInput(nil)
+            }
+        } else {
+            try? audioSession.setPreferredInput(nil)
+            try audioSession.setCategory(.playback, mode: .default)
+            try? audioSession.setPreferredSampleRate(Double(playerSampleRate))
+            try? audioSession.setPreferredIOBufferDuration(0.01)
+            try audioSession.setActive(true)
+        }
+
+        let audioEngine = AVAudioEngine()
+        var detectedInputRate: Int?
+
+        // Touch inputNode BEFORE attaching playback chain when recording so AVAudioEngine
+        // constructs a full-duplex IO graph rather than an output-only graph.
+        if let micTarget {
+            guard audioSession.isInputAvailable else {
+                throw BridgeError.microphoneUnavailable("系统当前无可用音频输入设备")
+            }
+            let input = audioEngine.inputNode
+            let hwFormat = input.inputFormat(forBus: 0)
+            let outFormat = input.outputFormat(forBus: 0)
+            let activeRate = outFormat.sampleRate > 0 ? outFormat.sampleRate : hwFormat.sampleRate
+            let activeChannels = outFormat.channelCount > 0 ? outFormat.channelCount : hwFormat.channelCount
+            guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0,
+                  outFormat.sampleRate > 0, outFormat.channelCount > 0 else {
+                throw BridgeError.microphoneUnavailable(
+                    "hw=\(Int(hwFormat.sampleRate))Hz/\(hwFormat.channelCount)ch, bus=\(Int(outFormat.sampleRate))Hz/\(outFormat.channelCount)ch"
+                )
+            }
+
+            Self.installMicrophoneTap(
+                on: input,
+                targetRate: micTarget.rate,
+                targetChannels: micTarget.channels,
+                continuation: micTarget.continuation
+            )
+            micTapInstalled = true
+            detectedInputRate = Int(activeRate.rounded())
+            _ = activeChannels
+        }
+
+        let playFormat = AVAudioFormat(standardFormatWithSampleRate: Double(playerSampleRate), channels: 2)!
+        let source = Self.makePlaybackSourceNode(format: playFormat, buffer: buffer)
         audioEngine.attach(source)
-        audioEngine.connect(source, to: audioEngine.mainMixerNode, format: format)
+        audioEngine.connect(source, to: audioEngine.mainMixerNode, format: playFormat)
+
         audioEngine.prepare()
         try audioEngine.start()
-        pcmBuffer = buffer
         engine = audioEngine
-        return buffer
+
+        engineConfigObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.scheduleRouteRecovery()
+            }
+        }
+
+        return detectedInputRate
+    }
+
+    @MainActor
+    private func rebuildMicEngineWithRetry(
+        playerSampleRate: Int,
+        buffer: PCMBuffer,
+        micTarget: (rate: Int, channels: Int, continuation: AsyncStream<Data>.Continuation)
+    ) async throws -> Int {
+        var lastError: Error?
+        for attempt in 0..<6 {
+            do {
+                if let rate = try rebuildAudioEngine(
+                    playerSampleRate: playerSampleRate,
+                    buffer: buffer,
+                    micTarget: micTarget
+                ) {
+                    return rate
+                }
+                return micTarget.rate
+            } catch {
+                lastError = error
+                if attempt < 5 {
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                }
+            }
+        }
+        throw lastError ?? BridgeError.microphoneUnavailable("蓝牙/麦克风路由初始化超时")
+    }
+
+    @MainActor
+    private func applyMicSourceChange() async {
+        guard isConnected, isMicActive,
+              let config = serverConfig,
+              let targetRate = config.micRate,
+              let targetChannels = config.micChannels,
+              let buffer = pcmBuffer,
+              let continuation = micContinuation else { return }
+        do {
+            let inputRate = try await rebuildMicEngineWithRetry(
+                playerSampleRate: config.sampleRate,
+                buffer: buffer,
+                micTarget: (targetRate, targetChannels, continuation)
+            )
+            if let micSocket {
+                try? await sendMicrophoneInfo(inputRate: inputRate, targetRate: targetRate, on: micSocket)
+            }
+            if let audioSocket {
+                let outRate = Int(AVAudioSession.sharedInstance().sampleRate.rounded())
+                if outRate > 0 {
+                    sendPlaybackInfo(outRate, on: audioSocket)
+                }
+            }
+            let routeName = AVAudioSession.sharedInstance().currentRoute.inputs.first?.portName ?? micSourceMode.title
+            status = "麦克风已回传 (\(routeName)) · \(inputRate) Hz → \(targetRate) Hz"
+        } catch {
+            status = "切换麦克风音源失败：\(error.localizedDescription)"
+        }
+    }
+
+    @MainActor
+    private func scheduleRouteRecovery() {
+        routeRebuildTask?.cancel()
+        routeRebuildTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard let self, !Task.isCancelled, self.isConnected,
+                  let config = self.serverConfig,
+                  let buffer = self.pcmBuffer else { return }
+            if let engine = self.engine, engine.isRunning {
+                return
+            }
+            do {
+                if self.isMicActive,
+                   let targetRate = config.micRate,
+                   let targetChannels = config.micChannels,
+                   let continuation = self.micContinuation {
+                    let inRate = try await self.rebuildMicEngineWithRetry(
+                        playerSampleRate: config.sampleRate,
+                        buffer: buffer,
+                        micTarget: (targetRate, targetChannels, continuation)
+                    )
+                    if let micSocket = self.micSocket {
+                        try? await self.sendMicrophoneInfo(
+                            inputRate: inRate,
+                            targetRate: targetRate,
+                            on: micSocket
+                        )
+                    }
+                    let routeName = AVAudioSession.sharedInstance().currentRoute.inputs.first?.portName ?? self.micSourceMode.title
+                    self.status = "麦克风已回传 (\(routeName)) · \(inRate) Hz → \(targetRate) Hz"
+                } else {
+                    _ = try self.rebuildAudioEngine(
+                        playerSampleRate: config.sampleRate,
+                        buffer: buffer,
+                        micTarget: nil
+                    )
+                }
+                if let audioSocket = self.audioSocket {
+                    let outRate = Int(AVAudioSession.sharedInstance().sampleRate.rounded())
+                    if outRate > 0 {
+                        self.sendPlaybackInfo(outRate, on: audioSocket)
+                    }
+                }
+            } catch {
+                self.status = "音频路由变化后恢复失败：\(error.localizedDescription)"
+            }
+        }
     }
 
     private func receiveAudio(from socket: URLSessionWebSocketTask, into buffer: PCMBuffer, initialChannels: Int) async {
@@ -244,7 +538,8 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
               config.micAvailable == true,
               let targetRate = config.micRate, targetRate > 0,
               let targetChannels = config.micChannels, (1...2).contains(targetChannels),
-              let session else {
+              let session,
+              let buffer = pcmBuffer else {
             status = "电脑端未检测到 VB-Cable，无法回传麦克风。"
             return
         }
@@ -258,33 +553,32 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
             return
         }
 
-        do {
-            try audioSession.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth, .allowBluetoothA2DP])
-            try audioSession.setActive(true)
+        var continuation: AsyncStream<Data>.Continuation!
+        let stream = AsyncStream<Data>(bufferingPolicy: .bufferingNewest(8)) {
+            continuation = $0
+        }
+        micContinuation = continuation
 
-            let input = engine?.inputNode
-            guard let input else { throw BridgeError.microphoneUnavailable }
-            let inputFormat = input.inputFormat(forBus: 0)
-            guard inputFormat.sampleRate > 0,
-                  let outputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
-                                                   sampleRate: Double(targetRate),
-                                                   channels: AVAudioChannelCount(targetChannels),
-                                                   interleaved: true),
-                  let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-                throw BridgeError.microphoneUnavailable
-            }
+        do {
+            let inputRate = try await rebuildMicEngineWithRetry(
+                playerSampleRate: config.sampleRate,
+                buffer: buffer,
+                micTarget: (targetRate, targetChannels, continuation)
+            )
 
             let baseURL = try validatedBaseURL()
             let socket = session.webSocketTask(with: endpoint("mic", baseURL: baseURL, secureWebSocket: true))
             micSocket = socket
             socket.resume()
-            try await sendMicrophoneInfo(inputRate: Int(inputFormat.sampleRate), targetRate: targetRate, on: socket)
+            try await sendMicrophoneInfo(inputRate: inputRate, targetRate: targetRate, on: socket)
 
-            var continuation: AsyncStream<Data>.Continuation!
-            let stream = AsyncStream<Data>(bufferingPolicy: .bufferingNewest(5)) {
-                continuation = $0
+            if let audioSocket {
+                let actualOutRate = Int(AVAudioSession.sharedInstance().sampleRate.rounded())
+                if actualOutRate > 0 {
+                    sendPlaybackInfo(actualOutRate, on: audioSocket)
+                }
             }
-            micContinuation = continuation
+
             micSendTask = Task {
                 for await packet in stream {
                     guard !Task.isCancelled else { break }
@@ -296,37 +590,13 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
                 }
             }
 
-            input.removeTap(onBus: 0)
-            input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { buffer, _ in
-                let ratio = outputFormat.sampleRate / inputFormat.sampleRate
-                let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 64)
-                guard let converted = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: max(64, capacity)) else { return }
-                var providedInput = false
-                var conversionError: NSError?
-                let result = converter.convert(to: converted, error: &conversionError) { _, inputStatus in
-                    if providedInput {
-                        inputStatus.pointee = .noDataNow
-                        return nil
-                    }
-                    providedInput = true
-                    inputStatus.pointee = .haveData
-                    return buffer
-                }
-                guard result != .error, converted.frameLength > 0,
-                      let audioData = converted.audioBufferList.pointee.mBuffers.mData else { return }
-                let bytesPerFrame = Int(outputFormat.streamDescription.pointee.mBytesPerFrame)
-                let packet = Data(bytes: audioData, count: Int(converted.frameLength) * bytesPerFrame)
-                continuation.yield(packet)
-            }
-            micTapInstalled = true
-
-            if let engine, !engine.isRunning { try engine.start() }
-            micConverter = converter
             isMicActive = true
-            status = "麦克风已回传 · \(targetRate) Hz"
+            let routeName = AVAudioSession.sharedInstance().currentRoute.inputs.first?.portName ?? micSourceMode.title
+            status = "麦克风已回传 (\(routeName)) · \(inputRate) Hz → \(targetRate) Hz"
         } catch {
+            let errorMessage = error.localizedDescription
             stopMicrophone()
-            status = "无法启动麦克风：\(error.localizedDescription)"
+            status = "无法启动麦克风：\(errorMessage)"
         }
     }
 
@@ -343,38 +613,55 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
 
     @MainActor
     private func stopMicrophone() {
-        if micTapInstalled {
-            engine?.inputNode.removeTap(onBus: 0)
-            micTapInstalled = false
-        }
+        routeRebuildTask?.cancel()
+        routeRebuildTask = nil
         micContinuation?.finish()
         micContinuation = nil
         micSendTask?.cancel()
         micSendTask = nil
         micSocket?.cancel(with: .normalClosure, reason: nil)
         micSocket = nil
-        micConverter = nil
         isMicActive = false
-        if isConnected {
+        if isConnected, let config = serverConfig, let buffer = pcmBuffer {
             do {
-                try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
-                try AVAudioSession.sharedInstance().setActive(true)
-                status = "已连接 · \(deviceName) · \(sampleRate ?? 0) Hz"
+                _ = try rebuildAudioEngine(
+                    playerSampleRate: config.sampleRate,
+                    buffer: buffer,
+                    micTarget: nil
+                )
+                if let audioSocket {
+                    let outRate = Int(AVAudioSession.sharedInstance().sampleRate.rounded())
+                    if outRate > 0 {
+                        sendPlaybackInfo(outRate, on: audioSocket)
+                    }
+                }
+                status = "已连接 · \(deviceName) · \(sampleRate ?? config.sampleRate) Hz"
             } catch {
                 status = "麦克风已停止；音频路由恢复失败：\(error.localizedDescription)"
             }
+        } else {
+            teardownEngineOnly()
         }
     }
 
     @MainActor
     private func disconnect(message: String) {
-        if isMicActive { stopMicrophone() }
+        routeRebuildTask?.cancel()
+        routeRebuildTask = nil
+        if isMicActive {
+            micContinuation?.finish()
+            micContinuation = nil
+            micSendTask?.cancel()
+            micSendTask = nil
+            micSocket?.cancel(with: .normalClosure, reason: nil)
+            micSocket = nil
+            isMicActive = false
+        }
         receiveTask?.cancel()
         receiveTask = nil
         audioSocket?.cancel(with: .normalClosure, reason: nil)
         audioSocket = nil
-        engine?.stop()
-        engine = nil
+        teardownEngineOnly()
         pcmBuffer = nil
         session?.invalidateAndCancel()
         session = nil
@@ -453,7 +740,7 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
 private enum BridgeError: LocalizedError {
     case invalidAddress
     case invalidAudioConfig
-    case microphoneUnavailable
+    case microphoneUnavailable(String)
     case serverResponse
 
     var errorDescription: String? {
@@ -462,8 +749,8 @@ private enum BridgeError: LocalizedError {
             return "请输入电脑控制台显示的 HTTPS 根地址，例如 https://192.168.1.20:8443。"
         case .invalidAudioConfig:
             return "电脑服务返回了不支持的音频格式。"
-        case .microphoneUnavailable:
-            return "无法获取 iPhone 麦克风音频格式。"
+        case .microphoneUnavailable(let detail):
+            return "无法获取 iPhone 麦克风音频格式（\(detail)）。"
         case .serverResponse:
             return "电脑服务未返回有效配置，请确认地址和服务状态。"
         }

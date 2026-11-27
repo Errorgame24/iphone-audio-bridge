@@ -88,3 +88,42 @@ final class PCMBuffer {
         return Float(Int16(bitPattern: rawValue)) / 32768
     }
 }
+
+enum PCMMicEncoder {
+    static func encodeInterleavedInt16(
+        left: UnsafePointer<Float>,
+        right: UnsafePointer<Float>?,
+        frameCount: Int,
+        targetChannels: Int
+    ) -> Data {
+        guard frameCount > 0, (1...2).contains(targetChannels) else { return Data() }
+        let sampleCount = frameCount * targetChannels
+        var data = Data(count: sampleCount * MemoryLayout<Int16>.size)
+        data.withUnsafeMutableBytes { rawBuffer in
+            guard let out = rawBuffer.baseAddress?.assumingMemoryBound(to: Int16.self) else { return }
+            if targetChannels == 1 {
+                for i in 0..<frameCount {
+                    let mono = right != nil ? 0.5 * (left[i] + right![i]) : left[i]
+                    out[i] = floatToInt16(mono).littleEndian
+                }
+            } else {
+                for i in 0..<frameCount {
+                    let l = left[i]
+                    let r = right != nil ? right![i] : l
+                    out[i * 2] = floatToInt16(l).littleEndian
+                    out[i * 2 + 1] = floatToInt16(r).littleEndian
+                }
+            }
+        }
+        return data
+    }
+
+    @inline(__always)
+    private static func floatToInt16(_ value: Float) -> Int16 {
+        if value.isNaN { return 0 }
+        let clamped = min(1.0, max(-1.0, value))
+        return clamped < 0
+            ? Int16(clamped * 32_768.0)
+            : Int16(clamped * 32_767.0)
+    }
+}
