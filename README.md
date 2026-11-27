@@ -1,8 +1,14 @@
 # iPhone Audio Bridge
 
+> **致谢与说明 / Attribution & AI Disclosure**
+> - 本仓库基于原作者 **[darknezzze/iphone-audio-bridge](https://github.com/darknezzze/iphone-audio-bridge)**（MIT License）进行二次开发，感谢原作者的开源工作。
+> - **本仓库中的所有二次开发代码均完全由 AI 编写**（包括 Windows 桌面悬浮面板与托盘、AirPods / iPhone 电量实时监控、AudioWorklet 抗混叠重采样优化，以及 `ios/` 原生 SwiftUI 客户端与云端 IPA 打包流程）。
+>
+> *Based on [darknezzze/iphone-audio-bridge](https://github.com/darknezzze/iphone-audio-bridge) under the MIT License. All secondary development and newly added code in this repository were **written entirely by AI**.*
+
 **Stream your Windows PC's system audio to an iPhone over Wi-Fi and listen with AirPods or any Bluetooth headphones. Optionally use the iPhone microphone as a microphone on the PC.**
 
-The iPhone client is available in Safari, with an experimental native iOS app source in `ios/`. The PC side is a small Python server (WASAPI loopback + WebSocket).
+The iPhone client is available in Safari, with an experimental native iOS app source in `ios/`. The PC side is a small Python server (WASAPI loopback + WebSocket) with a Windows desktop floating panel and real-time AirPods / iPhone battery monitor.
 
 Useful when your PC has no Bluetooth adapter, or when you want to use headphones that are paired with your iPhone to listen to PC audio.
 
@@ -10,11 +16,13 @@ Useful when your PC has no Bluetooth adapter, or when you want to use headphones
 
 - PC system audio -> iPhone -> Bluetooth headphones / AirPods
 - iPhone microphone -> PC, as a virtual microphone via VB-Cable
+- Windows desktop floating panel + system tray (`desktop_ui.py`) with audio sample-rate details & one-click server restart
+- Real-time AirPods / Beats (BLE Continuity) & iPhone (Apple Lockdown / BLE) battery display (`battery_monitor.py`)
 - Works in Safari, no iOS app needed
 - Native iOS client can be built as an unsigned IPA on GitHub Actions (`Build iOS IPA`)
 - Keeps playing in the background and with the screen locked (via an `<audio>` element and Media Session; behavior depends on the iOS version)
 - Low-latency tuning: short queues, drops old audio instead of lagging behind
-- Sample rate and channels are detected automatically
+- Sample rate and channels are detected automatically (with default playback device hot-switching)
 - Self-signed HTTPS certificate is generated automatically (required by iOS for microphone access)
 
 ## How it works
