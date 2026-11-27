@@ -16,10 +16,10 @@ targets:
       - path: AudioBridge
         excludes:
           - Info.plist
-    info:
-      path: AudioBridge/Info.plist
     settings:
       base:
+        INFOPLIST_FILE: AudioBridge/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
         PRODUCT_BUNDLE_IDENTIFIER: com.local.audiobridge.client
         PRODUCT_NAME: AudioBridge
         CODE_SIGNING_ALLOWED: NO
