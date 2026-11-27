@@ -4,3 +4,5 @@ cryptography
 bleak
 pystray
 pillow
+zeroconf
+winrt-Windows.Media.Control; sys_platform == "win32"

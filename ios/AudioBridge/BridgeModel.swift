@@ -2,15 +2,63 @@ import AVFoundation
 import Combine
 import CryptoKit
 import Foundation
+import MediaPlayer
 import Security
+import UIKit
 
-private struct ServerConfig: Decodable {
+struct NowPlayingSnapshot: Decodable, Equatable {
+    let hasSession: Bool?
+    let playing: Bool?
+    let title: String?
+    let artist: String?
+    let album: String?
+    let app: String?
+    let hostname: String?
+    let deviceName: String?
+}
+
+struct ServerConfig: Decodable, Equatable {
     let sampleRate: Int
     let channels: Int
     let deviceName: String?
+    let hostname: String?
     let micAvailable: Bool?
     let micRate: Int?
     let micChannels: Int?
+    let nowPlaying: NowPlayingSnapshot?
+}
+
+enum InboundSocketEvent: Equatable {
+    case config(ServerConfig)
+    case nowPlaying(NowPlayingSnapshot)
+    case unknown
+}
+
+enum InboundMessageParser {
+    private struct Envelope: Decodable {
+        let type: String?
+    }
+
+    static func parse(_ jsonText: String) -> InboundSocketEvent {
+        guard let data = jsonText.data(using: .utf8),
+              let env = try? JSONDecoder().decode(Envelope.self, from: data) else {
+            return .unknown
+        }
+        switch env.type {
+        case "now-playing":
+            if let snap = try? JSONDecoder().decode(NowPlayingSnapshot.self, from: data) {
+                return .nowPlaying(snap)
+            }
+            return .unknown
+        case "config", nil:
+            if let cfg = try? JSONDecoder().decode(ServerConfig.self, from: data) {
+                return .config(cfg)
+            }
+            return .unknown
+        default:
+            return .unknown
+        }
+    }
 }
 
 private struct PendingTrust {
@@ -52,44 +100,132 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
             }
         }
     }
-    @Published private(set) var status = "输入电脑上显示的 HTTPS 地址，然后连接。"
+
+    @Published private(set) var status = "正在自动扫描局域网电脑，也可手动输入地址连接。"
     @Published private(set) var isConnected = false
     @Published private(set) var isConnecting = false
+    @Published private(set) var isReconnecting = false
     @Published private(set) var isMicActive = false
     @Published private(set) var deviceName = ""
+    @Published private(set) var serverHostname = ""
     @Published private(set) var sampleRate: Int?
     @Published private(set) var micAvailable = false
     @Published var isTrustPromptPresented = false
     @Published private(set) var certificateFingerprint = ""
 
+    // System Now Playing & AirPods / Control Center state
+    @Published private(set) var nowPlayingTitle = "Windows 电脑音频"
+    @Published private(set) var nowPlayingArtist = "Nightcord Audio Bridge"
+    @Published private(set) var remoteIsPlaying = true
+
+    // Automatic LAN discovery
+    @Published private(set) var discoveredServers: [DiscoveredServer] = []
+    @Published private(set) var isScanningLAN = false
+
+    private var discovery: ServerDiscovery?
+    private var cancellables = Set<AnyCancellable>()
     private var session: URLSession?
     private var audioSocket: URLSessionWebSocketTask?
     private var micSocket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
+    private var pingTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
     private var micSendTask: Task<Void, Never>?
     private var micContinuation: AsyncStream<Data>.Continuation?
     private var engine: AVAudioEngine?
     private var engineConfigObserver: NSObjectProtocol?
+    private var sessionObservers: [NSObjectProtocol] = []
     private var routeRebuildTask: Task<Void, Never>?
     private var pcmBuffer: PCMBuffer?
     private var micTapInstalled = false
     private var serverConfig: ServerConfig?
     private var pendingTrust: PendingTrust?
 
+    private var userWantsConnected = false
+    private var userWantsMic = false
+    private var remoteCommandsInstalled = false
+    private var cachedArtwork: MPMediaItemArtwork?
+    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+
+    override init() {
+        super.init()
+        Task { @MainActor [weak self] in
+            self?.installSystemAudioLifecycleObservers()
+        }
+    }
+
+    deinit {
+        for obs in sessionObservers {
+            NotificationCenter.default.removeObserver(obs)
+        }
+    }
+
+    // MARK: - LAN Discovery
+
+    @MainActor
+    func startDiscoveryIfNeeded() {
+        if discovery == nil {
+            let disc = ServerDiscovery()
+            discovery = disc
+            disc.$servers
+                .receive(on: RunLoop.main)
+                .sink { [weak self] list in
+                    guard let self else { return }
+                    self.discoveredServers = list
+                    if self.serverAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       let first = list.first {
+                        self.serverAddress = first.urlString
+                    }
+                }
+                .store(in: &cancellables)
+
+            disc.$isScanning
+                .receive(on: RunLoop.main)
+                .sink { [weak self] scanning in
+                    self?.isScanningLAN = scanning
+                }
+                .store(in: &cancellables)
+
+            disc.start()
+        } else {
+            discovery?.scanNow()
+        }
+    }
+
+    @MainActor
+    func refreshDiscovery() {
+        startDiscoveryIfNeeded()
+    }
+
+    @MainActor
+    func connectToDiscovered(_ server: DiscoveredServer) {
+        serverAddress = server.urlString
+        if isConnected || isConnecting || userWantsConnected {
+            disconnect(message: "正在切换到 \(server.displayTitle)…")
+        }
+        userWantsConnected = true
+        Task { await connectToServer(isAutoReconnect: false) }
+    }
+
+    // MARK: - Connection & Microphone Controls
+
     @MainActor
     func toggleConnection() {
-        if isConnected || isConnecting {
+        if isConnected || isConnecting || userWantsConnected {
             disconnect(message: "已断开连接。")
         } else {
-            Task { await connectToServer() }
+            userWantsConnected = true
+            Task { await connectToServer(isAutoReconnect: false) }
         }
     }
 
     @MainActor
     func toggleMicrophone() {
-        if isMicActive {
+        if isMicActive || userWantsMic {
+            userWantsMic = false
             stopMicrophone()
         } else {
+            userWantsMic = true
             Task { await startMicrophone() }
         }
     }
@@ -107,25 +243,253 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
 
     @MainActor
     func rejectServerCertificate() {
+        userWantsConnected = false
         pendingTrust?.completion(.cancelAuthenticationChallenge, nil)
         pendingTrust = nil
         isTrustPromptPresented = false
         status = "未信任服务器证书，连接已取消。"
     }
 
+    // MARK: - Remote Media Transport (AirPods / Control Center / In-App)
+
     @MainActor
-    private func connectToServer() async {
+    func sendMediaCommand(_ action: String) {
+        let normalized = action.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return }
+
+        switch normalized {
+        case "play":
+            remoteIsPlaying = true
+        case "pause":
+            remoteIsPlaying = false
+        case "toggle":
+            remoteIsPlaying.toggle()
+        default:
+            break
+        }
+        updateNowPlayingCenter()
+
+        if let socket = audioSocket {
+            let payload: [String: Any] = ["type": "media", "action": normalized]
+            if let data = try? JSONSerialization.data(withJSONObject: payload),
+               let text = String(data: data, encoding: .utf8) {
+                Task {
+                    do {
+                        try await socket.send(.string(text))
+                    } catch {
+                        await self.sendMediaCommandViaHTTP(normalized)
+                    }
+                }
+                return
+            }
+        }
+
+        Task { await sendMediaCommandViaHTTP(normalized) }
+    }
+
+    @MainActor
+    private func sendMediaCommandViaHTTP(_ action: String) async {
+        guard let session, let baseURL = try? validatedBaseURL() else { return }
+        var req = URLRequest(url: endpoint("media", baseURL: baseURL, secureWebSocket: false))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 4
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["action": action])
+        _ = try? await session.data(for: req)
+    }
+
+    @MainActor
+    private func activateSystemMediaSource() {
+        UIApplication.shared.beginReceivingRemoteControlEvents()
+        installRemoteCommandsIfNeeded()
+        setRemoteCommandsEnabled(true)
+        updateNowPlayingCenter()
+    }
+
+    @MainActor
+    private func deactivateSystemMediaSource() {
+        setRemoteCommandsEnabled(false)
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
+        UIApplication.shared.endReceivingRemoteControlEvents()
+    }
+
+    @MainActor
+    private func installRemoteCommandsIfNeeded() {
+        guard !remoteCommandsInstalled else { return }
+        remoteCommandsInstalled = true
+
+        let center = MPRemoteCommandCenter.shared()
+        center.changePlaybackPositionCommand.isEnabled = false
+        center.skipForwardCommand.isEnabled = false
+        center.skipBackwardCommand.isEnabled = false
+
+        // AirPods single stem press triggers togglePlayPauseCommand
+        center.togglePlayPauseCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            Task { @MainActor in self.sendMediaCommand("toggle") }
+            return .success
+        }
+
+        // Control Center / Lock Screen Play button
+        center.playCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            Task { @MainActor in self.sendMediaCommand("play") }
+            return .success
+        }
+
+        // Control Center / Lock Screen Pause button:
+        // Because AVAudioEngine stays alive at -100 dBFS keepalive in background so iOS never
+        // suspends the app, iOS may send pauseCommand even when PC music is already paused.
+        // Routing false -> "play" makes Control Center tap 100% reliable in both states!
+        center.pauseCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            Task { @MainActor in
+                let targetAction = self.remoteIsPlaying ? "pause" : "play"
+                self.sendMediaCommand(targetAction)
+            }
+            return .success
+        }
+
+        // AirPods double press / Control Center Next
+        center.nextTrackCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            Task { @MainActor in self.sendMediaCommand("next") }
+            return .success
+        }
+
+        // AirPods triple press / Control Center Previous
+        center.previousTrackCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            Task { @MainActor in self.sendMediaCommand("prev") }
+            return .success
+        }
+    }
+
+    @MainActor
+    private func setRemoteCommandsEnabled(_ enabled: Bool) {
+        let center = MPRemoteCommandCenter.shared()
+        center.togglePlayPauseCommand.isEnabled = enabled
+        center.playCommand.isEnabled = enabled
+        center.pauseCommand.isEnabled = enabled
+        center.nextTrackCommand.isEnabled = enabled
+        center.previousTrackCommand.isEnabled = enabled
+    }
+
+    @MainActor
+    private func applyNowPlayingSnapshot(_ snap: NowPlayingSnapshot) {
+        if let host = snap.hostname, !host.isEmpty {
+            serverHostname = host
+        }
+        if let dev = snap.deviceName, !dev.isEmpty {
+            deviceName = dev
+        }
+        if let playing = snap.playing {
+            remoteIsPlaying = playing
+        }
+
+        let rawTitle = (snap.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawArtist = (snap.artist ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawApp = (snap.app ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !rawTitle.isEmpty {
+            nowPlayingTitle = rawTitle
+            if !rawArtist.isEmpty {
+                nowPlayingArtist = rawArtist
+            } else if !rawApp.isEmpty {
+                nowPlayingArtist = "\(rawApp) · \(serverHostname.isEmpty ? "电脑音频" : serverHostname)"
+            } else {
+                nowPlayingArtist = serverHostname.isEmpty ? deviceName : serverHostname
+            }
+        } else {
+            nowPlayingTitle = serverHostname.isEmpty ? "Windows 电脑实时音频" : "\(serverHostname) 音频流"
+            nowPlayingArtist = deviceName.isEmpty ? "Nightcord Audio Bridge" : deviceName
+        }
+
+        if isConnected || userWantsConnected {
+            updateNowPlayingCenter()
+        }
+    }
+
+    @MainActor
+    private func updateNowPlayingCenter() {
+        let artwork = resolveNowPlayingArtwork()
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: nowPlayingTitle,
+            MPMediaItemPropertyArtist: nowPlayingArtist,
+            MPMediaItemPropertyAlbumTitle: serverHostname.isEmpty ? "Nightcord Audio Bridge" : serverHostname,
+            MPNowPlayingInfoPropertyIsLiveStream: true,
+            MPNowPlayingInfoPropertyPlaybackRate: remoteIsPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
+        ]
+        if let artwork {
+            info[MPMediaItemPropertyArtwork] = artwork
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPNowPlayingInfoCenter.default().playbackState = remoteIsPlaying ? .playing : .paused
+    }
+
+    @MainActor
+    private func resolveNowPlayingArtwork() -> MPMediaItemArtwork? {
+        if let cachedArtwork {
+            return cachedArtwork
+        }
+        let img = UIImage(named: "NightcordArtwork") ?? Self.makeFallbackNightcordImage()
+        let art = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
+        cachedArtwork = art
+        return art
+    }
+
+    nonisolated private static func makeFallbackNightcordImage() -> UIImage {
+        let size = CGSize(width: 512, height: 512)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { ctx in
+            UIColor(red: 0.08, green: 0.06, blue: 0.12, alpha: 1.0).setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+            let circle = CGRect(x: 96, y: 96, width: 320, height: 320)
+            UIColor(red: 0.53, green: 0.27, blue: 0.60, alpha: 1.0).setStroke()
+            let path = UIBezierPath(ovalIn: circle)
+            path.lineWidth = 18
+            path.stroke()
+        }
+    }
+
+    // MARK: - Core Connection & Background Keepalive / Auto-Reconnect
+
+    @MainActor
+    private func makeConfiguredURLSession() -> URLSession {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 10
+        cfg.shouldUseExtendedBackgroundIdleMode = true
+        cfg.networkServiceType = .av
+        cfg.waitsForConnectivity = false
+        return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+    }
+
+    @MainActor
+    private func connectToServer(isAutoReconnect: Bool) async {
         guard !isConnecting else { return }
         isConnecting = true
-        status = "正在连接电脑服务…"
+        if !isAutoReconnect {
+            status = "正在连接电脑服务…"
+        }
+
+        beginTemporaryBackgroundExecution()
+        defer { endTemporaryBackgroundExecution() }
 
         do {
             let baseURL = try validatedBaseURL()
-            let urlSession = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-            session = urlSession
+            let urlSession: URLSession
+            if let existing = session {
+                urlSession = existing
+            } else {
+                let created = makeConfiguredURLSession()
+                session = created
+                urlSession = created
+            }
 
             var configRequest = URLRequest(url: endpoint("config", baseURL: baseURL, secureWebSocket: false))
-            configRequest.timeoutInterval = 10
+            configRequest.timeoutInterval = isAutoReconnect ? 5 : 10
             let (data, response) = try await urlSession.data(for: configRequest)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
                 throw BridgeError.serverResponse
@@ -135,40 +499,311 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
             guard config.sampleRate > 0, (1...2).contains(config.channels) else {
                 throw BridgeError.invalidAudioConfig
             }
+            let rateChanged = (sampleRate != nil && sampleRate != config.sampleRate)
             serverConfig = config
             deviceName = config.deviceName ?? "电脑音频"
+            serverHostname = config.hostname ?? serverHostname
             sampleRate = config.sampleRate
             micAvailable = config.micAvailable ?? false
 
-            let buffer = PCMBuffer(
-                capacity: max(2_048, config.sampleRate / 6),
-                prebufferFrames: max(512, config.sampleRate / 30)
-            )
-            pcmBuffer = buffer
-            _ = try rebuildAudioEngine(
-                playerSampleRate: config.sampleRate,
-                buffer: buffer,
-                micTarget: nil
-            )
+            let buffer: PCMBuffer
+            if let existingBuffer = pcmBuffer, !rateChanged {
+                existingBuffer.clear()
+                existingBuffer.setKeepAliveDither(true)
+                buffer = existingBuffer
+            } else {
+                let createdBuffer = PCMBuffer(
+                    capacity: max(2_048, config.sampleRate / 6),
+                    prebufferFrames: max(512, config.sampleRate / 30),
+                    keepAliveDither: true
+                )
+                pcmBuffer = createdBuffer
+                buffer = createdBuffer
+            }
+
+            // Keep existing running engine alive across background reconnects unless not running or rate changed!
+            if engine == nil || engine?.isRunning != true || rateChanged {
+                _ = try rebuildAudioEngine(
+                    playerSampleRate: config.sampleRate,
+                    buffer: buffer,
+                    micTarget: nil
+                )
+            }
+
+            if let snap = config.nowPlaying {
+                applyNowPlayingSnapshot(snap)
+            } else {
+                nowPlayingTitle = serverHostname.isEmpty ? "Windows 电脑实时音频" : "\(serverHostname) 音频流"
+                nowPlayingArtist = deviceName
+            }
+
+            pingTask?.cancel()
+            receiveTask?.cancel()
+            audioSocket?.cancel(with: .goingAway, reason: nil)
 
             let socket = urlSession.webSocketTask(with: endpoint("audio", baseURL: baseURL, secureWebSocket: true))
             audioSocket = socket
             socket.resume()
+
             isConnected = true
             isConnecting = false
+            isReconnecting = false
+            activateSystemMediaSource()
+
             let actualOutRate = Int(AVAudioSession.sharedInstance().sampleRate.rounded())
-            status = "已连接 · \(deviceName) · \(config.sampleRate) Hz"
+            status = "已连接 · \(serverHostname.isEmpty ? deviceName : serverHostname) · \(config.sampleRate) Hz"
             sendPlaybackInfo(actualOutRate > 0 ? actualOutRate : config.sampleRate, on: socket)
+
             let initialChannels = config.channels
+            startPingLoop(for: socket)
             receiveTask = Task.detached(priority: .userInitiated) { [weak self] in
                 guard let self else { return }
                 await self.receiveAudio(from: socket, into: buffer, initialChannels: initialChannels)
             }
+
+            if userWantsMic && !isMicActive && micAvailable {
+                await startMicrophone()
+            }
         } catch {
             isConnecting = false
-            disconnect(message: "连接失败：\(error.localizedDescription)")
+            if userWantsConnected {
+                // If initial manual connect failed before an engine ever started, show error unless already connected
+                if engine == nil && !isAutoReconnect {
+                    userWantsConnected = false
+                    disconnect(message: "连接失败：\(error.localizedDescription)")
+                } else {
+                    scheduleAutoReconnect(reason: error.localizedDescription)
+                }
+            } else {
+                disconnect(message: "连接已取消。")
+            }
         }
     }
+
+    @MainActor
+    private func startPingLoop(for socket: URLSessionWebSocketTask) {
+        pingTask?.cancel()
+        pingTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard let self, !Task.isCancelled, self.audioSocket === socket else { break }
+                let pingFailed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                    socket.sendPing { err in
+                        continuation.resume(returning: err != nil)
+                    }
+                }
+                if pingFailed, self.audioSocket === socket {
+                    socket.cancel(with: .abnormalClosure, reason: nil)
+                    break
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func handleSocketDrop(socket: URLSessionWebSocketTask, errorDescription: String) {
+        guard audioSocket === socket else { return }
+        pingTask?.cancel()
+        pingTask = nil
+        audioSocket?.cancel(with: .goingAway, reason: nil)
+        audioSocket = nil
+
+        if isMicActive {
+            tearDownMicSocketOnly()
+        }
+
+        guard userWantsConnected else {
+            disconnect(message: "已断开连接。")
+            return
+        }
+
+        // CRITICAL: Keep AVAudioEngine running continuously so iOS background audio assertion
+        // is NEVER revoked while Wi-Fi roams or PC restarts!
+        pcmBuffer?.clear()
+        ensureEngineRunningInBackground()
+        scheduleAutoReconnect(reason: errorDescription)
+    }
+
+    @MainActor
+    private func scheduleAutoReconnect(reason: String) {
+        guard userWantsConnected else { return }
+        if reconnectTask != nil { return }
+
+        isReconnecting = true
+        status = "信号波动，后台保活并自动重连中…"
+        beginTemporaryBackgroundExecution()
+
+        reconnectTask = Task { @MainActor [weak self] in
+            let delaysNs: [UInt64] = [
+                700_000_000,
+                1_500_000_000,
+                2_500_000_000,
+                4_000_000_000,
+            ]
+            var attempt = 0
+            while let self, !Task.isCancelled, self.userWantsConnected, self.audioSocket == nil {
+                let waitNs = delaysNs[min(attempt, delaysNs.count - 1)]
+                attempt += 1
+                try? await Task.sleep(nanoseconds: waitNs)
+                guard !Task.isCancelled, self.userWantsConnected, self.audioSocket == nil else { break }
+
+                self.ensureEngineRunningInBackground()
+                await self.connectToServer(isAutoReconnect: true)
+            }
+            self?.reconnectTask = nil
+            self?.endTemporaryBackgroundExecution()
+            let _ = reason
+        }
+    }
+
+    @MainActor
+    private func beginTemporaryBackgroundExecution() {
+        guard backgroundTaskID == .invalid else { return }
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "AudioBridgeKeepAlive") { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.endTemporaryBackgroundExecution()
+            }
+        }
+    }
+
+    @MainActor
+    private func endTemporaryBackgroundExecution() {
+        guard backgroundTaskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTaskID)
+        backgroundTaskID = .invalid
+    }
+
+    // MARK: - System Audio Interruption / Reset / Route Observers
+
+    @MainActor
+    private func installSystemAudioLifecycleObservers() {
+        guard sessionObservers.isEmpty else { return }
+        let nc = NotificationCenter.default
+        let audioSession = AVAudioSession.sharedInstance()
+
+        // 1. Phone calls / Siri / alarms / other app audio interruptions
+        let interObs = nc.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: audioSession,
+            queue: nil
+        ) { [weak self] note in
+            let typeRaw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            Task { @MainActor [weak self] in
+                guard let self, self.userWantsConnected, let typeRaw,
+                      let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
+                switch type {
+                case .began:
+                    self.beginTemporaryBackgroundExecution()
+                    self.status = "音频被系统通话/提示临时打断，等待自动恢复…"
+                case .ended:
+                    try? AVAudioSession.sharedInstance().setActive(true)
+                    self.ensureEngineRunningInBackground()
+                    self.updateNowPlayingCenter()
+                    if let host = self.serverHostname.isEmpty ? Optional(self.deviceName) : Optional(self.serverHostname),
+                       let rate = self.sampleRate {
+                        self.status = "已连接 · \(host) · \(rate) Hz"
+                    }
+                    self.endTemporaryBackgroundExecution()
+                @unknown default:
+                    break
+                }
+            }
+        }
+        sessionObservers.append(interObs)
+
+        // 2. CoreAudio mediaserverd reset
+        let resetObs = nc.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: audioSession,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.remoteCommandsInstalled = false
+                guard self.userWantsConnected else { return }
+                self.teardownEngineOnly()
+                self.ensureEngineRunningInBackground()
+                self.activateSystemMediaSource()
+            }
+        }
+        sessionObservers.append(resetObs)
+
+        // 3. AirPods / Bluetooth route changes (e.g. taking AirPods out of ears)
+        let routeObs = nc.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: audioSession,
+            queue: nil
+        ) { [weak self] note in
+            let reasonRaw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            Task { @MainActor [weak self] in
+                guard let self, self.userWantsConnected, let reasonRaw,
+                      let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw) else { return }
+                if reason == .oldDeviceUnavailable {
+                    // Pause PC music automatically when headphones disconnect / ear detection triggers,
+                    // while keeping iOS AVAudioEngine alive so background execution is preserved!
+                    if self.remoteIsPlaying {
+                        self.sendMediaCommand("pause")
+                    }
+                    self.scheduleRouteRecovery()
+                } else if reason == .newDeviceAvailable {
+                    self.scheduleRouteRecovery()
+                }
+            }
+        }
+        sessionObservers.append(routeObs)
+
+        // 4. Foreground return health check
+        let fgObs = nc.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.userWantsConnected {
+                    self.ensureEngineRunningInBackground()
+                    self.updateNowPlayingCenter()
+                    if self.audioSocket == nil && !self.isConnecting {
+                        self.reconnectTask?.cancel()
+                        self.reconnectTask = nil
+                        await self.connectToServer(isAutoReconnect: true)
+                    }
+                } else {
+                    self.discovery?.scanNow()
+                }
+            }
+        }
+        sessionObservers.append(fgObs)
+    }
+
+    @MainActor
+    private func ensureEngineRunningInBackground() {
+        guard userWantsConnected,
+              let config = serverConfig,
+              let buffer = pcmBuffer else { return }
+
+        if let engine, engine.isRunning {
+            return
+        }
+
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+            if let engine {
+                try engine.start()
+                return
+            }
+        } catch {
+            // Fall through to full engine rebuild
+        }
+
+        _ = try? rebuildAudioEngine(
+            playerSampleRate: config.sampleRate,
+            buffer: buffer,
+            micTarget: nil
+        )
+    }
+
+    // MARK: - URL Validation & Audio Engine Graph
 
     @MainActor
     private func validatedBaseURL() throws -> URL {
@@ -334,8 +969,6 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
         let audioEngine = AVAudioEngine()
         var detectedInputRate: Int?
 
-        // Touch inputNode BEFORE attaching playback chain when recording so AVAudioEngine
-        // constructs a full-duplex IO graph rather than an output-only graph.
         if let micTarget {
             guard audioSession.isInputAvailable else {
                 throw BridgeError.microphoneUnavailable("系统当前无可用音频输入设备")
@@ -447,7 +1080,7 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
         routeRebuildTask?.cancel()
         routeRebuildTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
-            guard let self, !Task.isCancelled, self.isConnected,
+            guard let self, !Task.isCancelled, self.userWantsConnected,
                   let config = self.serverConfig,
                   let buffer = self.pcmBuffer else { return }
             if let engine = self.engine, engine.isRunning {
@@ -479,6 +1112,7 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
                         micTarget: nil
                     )
                 }
+                self.updateNowPlayingCenter()
                 if let audioSocket = self.audioSocket {
                     let outRate = Int(AVAudioSession.sharedInstance().sampleRate.rounded())
                     if outRate > 0 {
@@ -491,7 +1125,11 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
         }
     }
 
-    private func receiveAudio(from socket: URLSessionWebSocketTask, into buffer: PCMBuffer, initialChannels: Int) async {
+    private func receiveAudio(
+        from socket: URLSessionWebSocketTask,
+        into buffer: PCMBuffer,
+        initialChannels: Int
+    ) async {
         var currentChannels = initialChannels
         while !Task.isCancelled {
             do {
@@ -499,17 +1137,20 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
                 case .data(let data):
                     buffer.append(data, channels: currentChannels)
                 case .string(let message):
-                    if let data = message.data(using: .utf8),
-                       let updated = try? JSONDecoder().decode(ServerConfig.self, from: data) {
+                    switch InboundMessageParser.parse(message) {
+                    case .nowPlaying(let snap):
+                        await MainActor.run {
+                            self.applyNowPlayingSnapshot(snap)
+                        }
+                    case .config(let updated):
                         if (1...2).contains(updated.channels) {
                             currentChannels = updated.channels
                         }
                         await MainActor.run {
-                            self.deviceName = updated.deviceName ?? self.deviceName
-                            if updated.sampleRate != self.sampleRate {
-                                self.status = "电脑采样率已变化，请断开后重新连接。"
-                            }
+                            self.handleLiveConfigUpdate(updated, buffer: buffer)
                         }
+                    case .unknown:
+                        break
                     }
                 @unknown default:
                     break
@@ -517,11 +1158,33 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
             } catch {
                 guard !Task.isCancelled else { break }
                 await MainActor.run {
-                    self.disconnect(message: "音频连接中断：\(error.localizedDescription)")
+                    self.handleSocketDrop(socket: socket, errorDescription: error.localizedDescription)
                 }
                 break
             }
         }
+    }
+
+    @MainActor
+    private func handleLiveConfigUpdate(_ updated: ServerConfig, buffer: PCMBuffer) {
+        deviceName = updated.deviceName ?? deviceName
+        if let h = updated.hostname, !h.isEmpty {
+            serverHostname = h
+        }
+        if let snap = updated.nowPlaying {
+            applyNowPlayingSnapshot(snap)
+        }
+        if updated.sampleRate > 0, updated.sampleRate != sampleRate {
+            sampleRate = updated.sampleRate
+            buffer.clear()
+            _ = try? rebuildAudioEngine(
+                playerSampleRate: updated.sampleRate,
+                buffer: buffer,
+                micTarget: nil
+            )
+            status = "已连接 · \(serverHostname.isEmpty ? deviceName : serverHostname) · \(updated.sampleRate) Hz"
+        }
+        updateNowPlayingCenter()
     }
 
     @MainActor
@@ -532,6 +1195,8 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
         Task { try? await socket.send(.string(text)) }
     }
 
+    // MARK: - Microphone Streaming
+
     @MainActor
     private func startMicrophone() async {
         guard isConnected, let config = serverConfig,
@@ -540,6 +1205,7 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
               let targetChannels = config.micChannels, (1...2).contains(targetChannels),
               let session,
               let buffer = pcmBuffer else {
+            userWantsMic = false
             status = "电脑端未检测到 VB-Cable，无法回传麦克风。"
             return
         }
@@ -549,6 +1215,7 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
             audioSession.requestRecordPermission { granted in continuation.resume(returning: granted) }
         }
         guard allowed else {
+            userWantsMic = false
             status = "请在 iPhone 设置中允许 Audio Bridge 使用麦克风。"
             return
         }
@@ -584,13 +1251,14 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
                     guard !Task.isCancelled else { break }
                     do { try await socket.send(.data(packet)) }
                     catch {
-                        await MainActor.run { self.status = "麦克风回传中断：\(error.localizedDescription)" }
+                        await MainActor.run { self.status = "麦克风回传中断，等待网络恢复…" }
                         break
                     }
                 }
             }
 
             isMicActive = true
+            updateNowPlayingCenter()
             let routeName = AVAudioSession.sharedInstance().currentRoute.inputs.first?.portName ?? micSourceMode.title
             status = "麦克风已回传 (\(routeName)) · \(inputRate) Hz → \(targetRate) Hz"
         } catch {
@@ -612,9 +1280,7 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
     }
 
     @MainActor
-    private func stopMicrophone() {
-        routeRebuildTask?.cancel()
-        routeRebuildTask = nil
+    private func tearDownMicSocketOnly() {
         micContinuation?.finish()
         micContinuation = nil
         micSendTask?.cancel()
@@ -622,20 +1288,28 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
         micSocket?.cancel(with: .normalClosure, reason: nil)
         micSocket = nil
         isMicActive = false
-        if isConnected, let config = serverConfig, let buffer = pcmBuffer {
+    }
+
+    @MainActor
+    private func stopMicrophone() {
+        routeRebuildTask?.cancel()
+        routeRebuildTask = nil
+        tearDownMicSocketOnly()
+        if userWantsConnected, let config = serverConfig, let buffer = pcmBuffer {
             do {
                 _ = try rebuildAudioEngine(
                     playerSampleRate: config.sampleRate,
                     buffer: buffer,
                     micTarget: nil
                 )
+                updateNowPlayingCenter()
                 if let audioSocket {
                     let outRate = Int(AVAudioSession.sharedInstance().sampleRate.rounded())
                     if outRate > 0 {
                         sendPlaybackInfo(outRate, on: audioSocket)
                     }
                 }
-                status = "已连接 · \(deviceName) · \(sampleRate ?? config.sampleRate) Hz"
+                status = "已连接 · \(serverHostname.isEmpty ? deviceName : serverHostname) · \(sampleRate ?? config.sampleRate) Hz"
             } catch {
                 status = "麦克风已停止；音频路由恢复失败：\(error.localizedDescription)"
             }
@@ -646,32 +1320,45 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
 
     @MainActor
     private func disconnect(message: String) {
+        userWantsConnected = false
+        userWantsMic = false
+        isReconnecting = false
+
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        pingTask?.cancel()
+        pingTask = nil
         routeRebuildTask?.cancel()
         routeRebuildTask = nil
-        if isMicActive {
-            micContinuation?.finish()
-            micContinuation = nil
-            micSendTask?.cancel()
-            micSendTask = nil
-            micSocket?.cancel(with: .normalClosure, reason: nil)
-            micSocket = nil
-            isMicActive = false
-        }
+
+        tearDownMicSocketOnly()
+
         receiveTask?.cancel()
         receiveTask = nil
         audioSocket?.cancel(with: .normalClosure, reason: nil)
         audioSocket = nil
+
+        deactivateSystemMediaSource()
         teardownEngineOnly()
         pcmBuffer = nil
+
         session?.invalidateAndCancel()
         session = nil
+        endTemporaryBackgroundExecution()
+
         isConnected = false
         isConnecting = false
         deviceName = ""
+        serverHostname = ""
         sampleRate = nil
         micAvailable = false
+        nowPlayingTitle = "Windows 电脑音频"
+        nowPlayingArtist = "Nightcord Audio Bridge"
+        remoteIsPlaying = true
         status = message
     }
+
+    // MARK: - TLS Certificate Pinning
 
     private func leafCertificate(from trust: SecTrust) -> SecCertificate? {
         guard let chain = SecTrustCopyCertificateChain(trust),
@@ -712,27 +1399,33 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
 
         DispatchQueue.main.async {
             self.pendingTrust?.completion(.cancelAuthenticationChallenge, nil)
-            self.pendingTrust = PendingTrust(trust: trust,
-                                             certificate: certificate,
-                                             fingerprint: fingerprint,
-                                             host: host,
-                                             pinKey: pinKey,
-                                             completion: completion)
+            self.pendingTrust = PendingTrust(
+                trust: trust,
+                certificate: certificate,
+                fingerprint: fingerprint,
+                host: host,
+                pinKey: pinKey,
+                completion: completion
+            )
             self.certificateFingerprint = fingerprint
             self.isTrustPromptPresented = true
         }
     }
 
-    func urlSession(_ session: URLSession,
-                    didReceive challenge: URLAuthenticationChallenge,
-                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
         handleTrustChallenge(challenge, completion: completionHandler)
     }
 
-    func urlSession(_ session: URLSession,
-                    task: URLSessionTask,
-                    didReceive challenge: URLAuthenticationChallenge,
-                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
         handleTrustChallenge(challenge, completion: completionHandler)
     }
 }

@@ -9,13 +9,35 @@ final class PCMBuffer {
     private var frameCount = 0
     private let prebufferFrames: Int
     private var isBuffering: Bool
+    private var keepAliveDither: Bool
+    private var ditherSign: Bool = false
 
-    init(capacity: Int = 16_384, prebufferFrames: Int = 0) {
+    /// -100 dBFS alternating float dither (~1e-5, below 16-bit PCM quantization step)
+    /// prevents CoreAudio / mediaremoted from treating silent passages as dead digital zeros.
+    private static let silentKeepAliveAmplitude: Float = 1.0e-5
+
+    init(capacity: Int = 16_384, prebufferFrames: Int = 0, keepAliveDither: Bool = false) {
         let safeCapacity = max(1, capacity)
         left = Array(repeating: 0, count: safeCapacity)
         right = Array(repeating: 0, count: safeCapacity)
         self.prebufferFrames = min(max(0, prebufferFrames), safeCapacity)
         self.isBuffering = self.prebufferFrames > 0
+        self.keepAliveDither = keepAliveDither
+    }
+
+    func setKeepAliveDither(_ enabled: Bool) {
+        lock.lock()
+        keepAliveDither = enabled
+        lock.unlock()
+    }
+
+    func clear() {
+        lock.lock()
+        readIndex = 0
+        writeIndex = 0
+        frameCount = 0
+        isBuffering = prebufferFrames > 0
+        lock.unlock()
     }
 
     func append(_ data: Data, channels: Int) {
@@ -60,8 +82,9 @@ final class PCMBuffer {
                 isBuffering = false
             } else {
                 for frame in 0..<requestedFrames {
-                    outputLeft[frame] = 0
-                    outputRight[frame] = 0
+                    let s = nextSilentSample()
+                    outputLeft[frame] = s
+                    outputRight[frame] = s
                 }
                 return
             }
@@ -69,18 +92,34 @@ final class PCMBuffer {
 
         for frame in 0..<requestedFrames {
             if frameCount > 0 {
-                outputLeft[frame] = left[readIndex]
-                outputRight[frame] = right[readIndex]
+                let l = left[readIndex]
+                let r = right[readIndex]
                 readIndex = (readIndex + 1) % left.count
                 frameCount -= 1
+                if keepAliveDither && l == 0 && r == 0 {
+                    let s = nextSilentSample()
+                    outputLeft[frame] = s
+                    outputRight[frame] = s
+                } else {
+                    outputLeft[frame] = l
+                    outputRight[frame] = r
+                }
             } else {
-                outputLeft[frame] = 0
-                outputRight[frame] = 0
+                let s = nextSilentSample()
+                outputLeft[frame] = s
+                outputRight[frame] = s
                 if prebufferFrames > 0 {
                     isBuffering = true
                 }
             }
         }
+    }
+
+    @inline(__always)
+    private func nextSilentSample() -> Float {
+        guard keepAliveDither else { return 0 }
+        ditherSign.toggle()
+        return ditherSign ? Self.silentKeepAliveAmplitude : -Self.silentKeepAliveAmplitude
     }
 
     private func sample(from bytes: UnsafePointer<UInt8>, at offset: Int) -> Float {

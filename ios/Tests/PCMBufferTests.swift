@@ -25,6 +25,62 @@ final class PCMBufferTests: XCTestCase {
         XCTAssertEqual(left[2], 0)
     }
 
+    func testKeepAliveDitherEmitsInaudibleNonZeroSignalWhenSilent() {
+        let buffer = PCMBuffer(capacity: 8, prebufferFrames: 4, keepAliveDither: true)
+        let (left, right) = render(buffer, frames: 4)
+        for i in 0..<4 {
+            XCTAssertNotEqual(left[i], 0)
+            XCTAssertEqual(abs(left[i]), 1.0e-5, accuracy: 1.0e-7)
+            XCTAssertEqual(left[i], right[i])
+        }
+
+        // Also replaces pure digital zero PCM packets with -100 dBFS keepalive dither
+        buffer.append(pcm16([0, 0, 0, 0, 0, 0, 0, 0]), channels: 2)
+        let (zeroLeft, _) = render(buffer, frames: 4)
+        XCTAssertTrue(zeroLeft.allSatisfy { $0 != 0 && abs($0) <= 2.0e-5 })
+
+        buffer.clear()
+        buffer.setKeepAliveDither(false)
+        let (silentLeft, _) = render(buffer, frames: 2)
+        XCTAssertEqual(silentLeft, [0, 0])
+    }
+
+    func testInboundMessageParserParsesNowPlayingAndConfig() {
+        let nowPlayingJson = """
+        {"type":"now-playing","playing":true,"title":"Idsmile","artist":"25-ji, Nightcord de.","hostname":"DESKTOP-2500"}
+        """
+        let event1 = InboundMessageParser.parse(nowPlayingJson)
+        guard case let .nowPlaying(snap) = event1 else {
+            return XCTFail("Expected .nowPlaying event")
+        }
+        XCTAssertEqual(snap.playing, true)
+        XCTAssertEqual(snap.title, "Idsmile")
+        XCTAssertEqual(snap.artist, "25-ji, Nightcord de.")
+        XCTAssertEqual(snap.hostname, "DESKTOP-2500")
+
+        let configJson = """
+        {"type":"config","sampleRate":48000,"channels":2,"deviceName":"CABLE Input","hostname":"DESKTOP-2500"}
+        """
+        let event2 = InboundMessageParser.parse(configJson)
+        guard case let .config(cfg) = event2 else {
+            return XCTFail("Expected .config event")
+        }
+        XCTAssertEqual(cfg.sampleRate, 48000)
+        XCTAssertEqual(cfg.channels, 2)
+        XCTAssertEqual(cfg.hostname, "DESKTOP-2500")
+    }
+
+    func testServerDiscoverySelectsSameSubnetIPv4First() {
+        let chosen = ServerDiscovery.selectBestIPv4(
+            candidates: ["192.168.56.1", "127.0.0.1", "10.58.10.204"],
+            localIPs: ["10.58.10.88"]
+        )
+        XCTAssertEqual(chosen, "10.58.10.204")
+        XCTAssertFalse(ServerDiscovery.isValidLANIPv4("127.0.0.1"))
+        XCTAssertFalse(ServerDiscovery.isValidLANIPv4("169.254.10.2"))
+        XCTAssertTrue(ServerDiscovery.isValidLANIPv4("192.168.1.15"))
+    }
+
     func testMonoMicFloatsDuplicateToInterleavedStereoInt16() {
         let samples: [Float] = [0.5, -1.5, 1.5]
         let packet = samples.withUnsafeBufferPointer { buf in

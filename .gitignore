@@ -9,6 +9,7 @@ cert.pem
 key.pem
 .audio_switcher_state.json
 .airpods_binding.json
+.audio_bridge.log
 
 # OS / editor
 .DS_Store
@@ -21,4 +22,5 @@ ios/*.xcodeproj/
 ios/build/
 dist/
 *.ipa
+*.lnk
 

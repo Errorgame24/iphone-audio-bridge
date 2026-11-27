@@ -1,9 +1,15 @@
+import datetime
 import tempfile
 from pathlib import Path
 import unittest
 
 from battery_monitor import BatteryMonitor
-from desktop_ui import DesktopPanel
+from desktop_ui import (
+    DesktopPanel,
+    _nightcord_clock_str,
+    create_tray_icon_image,
+    render_nightcord_emblem,
+)
 from server import _validated_sample_rate
 
 
@@ -133,6 +139,24 @@ class DesktopStatusTests(unittest.TestCase):
     def test_battery_text_does_not_add_wearing_ear_icon(self):
         text, _ = DesktopPanel._format_pod_value(None, 85, False, True)
         self.assertEqual(text, "85%")
+
+    def test_nightcord_clock_and_icons(self):
+        self.assertEqual(
+            _nightcord_clock_str(datetime.datetime(2026, 11, 27, 1, 5)),
+            "25:05",
+        )
+        self.assertEqual(
+            _nightcord_clock_str(datetime.datetime(2026, 11, 27, 20, 15)),
+            "25:00 · 20:15",
+        )
+        emblem = render_nightcord_emblem(48)
+        self.assertEqual(emblem.size, (48, 48))
+        self.assertEqual(emblem.mode, "RGBA")
+        self.assertEqual(emblem.getpixel((0, 0))[3], 0)
+
+        tray = create_tray_icon_image(connected=True, low_battery=False)
+        self.assertEqual(tray.size, (64, 64))
+        self.assertEqual(tray.mode, "RGBA")
 
 
 if __name__ == "__main__":

@@ -19,7 +19,10 @@ import pyaudiowpatch as pyaudio
 from aiohttp import web
 
 from audio_switcher import AudioDeviceSwitcher
+from autostart import AutoStartManager, resolve_windowless_python
 from battery_monitor import BatteryMonitor
+from lan_discovery import LanDiscoveryAdvertiser
+from media_control import WindowsMediaController
 
 
 HOST = "0.0.0.0"
@@ -28,9 +31,44 @@ PORT = 8443  # HTTPS is required for microphone access on iOS
 CHANNELS = 2
 CHUNK = 960
 DEVICE_POLL_INTERVAL = 1.2
+SILENCE_KEEPALIVE_INTERVAL = 0.20
+SILENCE_KEEPALIVE_FRAMES = 240
+SERVER_HOSTNAME = socket.gethostname() or "Windows-PC"
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
+_LOG_FILE_HANDLE = None
+
+
+def _ensure_windowless_stdio():
+    """Redirect None stdout/stderr under pythonw.exe to a local UTF-8 log file."""
+    global _LOG_FILE_HANDLE
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            _LOG_FILE_HANDLE = open(
+                BASE_DIR / ".audio_bridge.log",
+                mode="w",
+                encoding="utf-8",
+                buffering=1,
+                errors="replace",
+            )
+            if sys.stdout is None:
+                sys.stdout = _LOG_FILE_HANDLE
+            if sys.stderr is None:
+                sys.stderr = _LOG_FILE_HANDLE
+        except Exception:
+            pass
+
+
+_ensure_windowless_stdio()
 
 clients = set()
 client_audio_info = {}
@@ -45,6 +83,8 @@ pa = None
 audio_stream = None
 mic_stream = None
 active_render_id = None
+ssl_context_ref = None
+bound_lan_ip = "127.0.0.1"
 stream_lock = threading.Lock()
 shutdown_event = threading.Event()
 
@@ -59,6 +99,9 @@ mic_info = {"available": False, "rate": 48000, "channels": 2, "deviceName": ""}
 
 battery_monitor = BatteryMonitor(state_file=BASE_DIR / ".airpods_binding.json")
 audio_switcher = AudioDeviceSwitcher(BASE_DIR / ".audio_switcher_state.json")
+autostart_manager = AutoStartManager(script_path=BASE_DIR / "server.py")
+media_controller = WindowsMediaController()
+lan_advertiser = LanDiscoveryAdvertiser(port=PORT, hostname=SERVER_HOSTNAME)
 _console_ctrl_handler_ref = None
 
 
@@ -512,6 +555,18 @@ def build_stream_config_message():
         "sampleRate": stream_rate,
         "channels": stream_channels,
         "deviceName": stream_device_name,
+        "hostname": SERVER_HOSTNAME,
+        "nowPlaying": media_controller.get_cached_snapshot(),
+    }
+
+
+def build_now_playing_message(snapshot=None):
+    snap = snapshot if snapshot is not None else media_controller.get_cached_snapshot()
+    return {
+        "type": "now-playing",
+        "hostname": SERVER_HOSTNAME,
+        "deviceName": stream_device_name,
+        **snap,
     }
 
 
@@ -520,13 +575,41 @@ async def notify_clients_config():
         return
 
     payload = build_stream_config_message()
+    snapshot = list(clients)
     results = await asyncio.gather(
-        *(client.send_json(payload) for client in clients.copy()),
+        *(client.send_json(payload) for client in snapshot),
         return_exceptions=True,
     )
-    for client, res in zip(clients.copy(), results):
+    for client, res in zip(snapshot, results):
         if isinstance(res, Exception):
             clients.discard(client)
+
+
+async def notify_clients_now_playing(snapshot=None):
+    if not clients:
+        return
+
+    payload = build_now_playing_message(snapshot)
+    targets = list(clients)
+    results = await asyncio.gather(
+        *(client.send_json(payload) for client in targets),
+        return_exceptions=True,
+    )
+    for client, res in zip(targets, results):
+        if isinstance(res, Exception):
+            clients.discard(client)
+
+
+async def media_monitor_loop():
+    """Poll Windows GSMTC Now Playing info and push live updates to connected iPhones."""
+    while not shutdown_event.is_set():
+        try:
+            snap, changed = await media_controller.poll_now_playing()
+            if changed and clients:
+                await notify_clients_now_playing(snap)
+        except Exception:
+            pass
+        await asyncio.sleep(1.2)
 
 
 def _sync_loopback_after_endpoint_switch():
@@ -561,11 +644,32 @@ def trigger_restore_previous_audio():
 
 
 async def device_monitor_loop():
-    """Watch Windows default playback & recording devices, hot-switching loopback and UI state."""
+    """Watch Windows default audio devices and LAN IP changes (e.g. Wi-Fi connecting after boot)."""
+    global bound_lan_ip, server_url
     _, last_capture_id = await asyncio.to_thread(audio_switcher.get_current_default_ids)
+    ip_tick = 0
 
     while not shutdown_event.is_set():
         await asyncio.sleep(DEVICE_POLL_INTERVAL)
+
+        ip_tick += 1
+        if ip_tick >= 3:
+            ip_tick = 0
+            latest_ip = await asyncio.to_thread(get_local_ip)
+            if latest_ip and latest_ip != bound_lan_ip:
+                bound_lan_ip = latest_ip
+                server_url = f"https://{latest_ip}:{PORT}"
+                print(f"[~] LAN IP updated to {latest_ip} -> {server_url}")
+                if ssl_context_ref is not None:
+                    try:
+                        cert_p, key_p = await asyncio.to_thread(ensure_cert, latest_ip)
+                        ssl_context_ref.load_cert_chain(cert_p, key_p)
+                    except Exception as e:
+                        print("Failed to hot-reload TLS certificate:", e)
+                try:
+                    await lan_advertiser.update_ip(latest_ip)
+                except Exception as e:
+                    print("Failed to refresh LAN discovery IP:", e)
 
         current_render_id, current_capture_id = await asyncio.to_thread(
             audio_switcher.get_current_default_ids
@@ -594,6 +698,7 @@ async def websocket_handler(request):
     await ws.prepare(request)
 
     await ws.send_json(build_stream_config_message())
+    await ws.send_json(build_now_playing_message())
     clients.add(ws)
 
     print(f"[+] iPhone connected (clients: {len(clients)})")
@@ -606,13 +711,22 @@ async def websocket_handler(request):
                 payload = json.loads(message.data)
             except (TypeError, ValueError):
                 continue
-            if isinstance(payload, dict) and payload.get("type") == "audio-info":
+            if not isinstance(payload, dict):
+                continue
+
+            msg_type = payload.get("type")
+            if msg_type == "audio-info":
                 with client_info_lock:
                     client_audio_info[ws] = {
                         "playbackSampleRate": _validated_sample_rate(
                             payload.get("playbackSampleRate")
                         )
                     }
+            elif msg_type == "media":
+                action = str(payload.get("action") or "").strip().lower()
+                if action:
+                    result = await media_controller.execute_command(action)
+                    await notify_clients_now_playing(result.get("nowPlaying"))
     except Exception as e:
         print("WebSocket error:", e)
     finally:
@@ -688,8 +802,22 @@ async def _send_bytes_safe(client, data):
 
 
 async def audio_broadcast_loop():
+    """
+    Broadcast WASAPI loopback PCM frames to connected iPhones.
+    When Windows audio output is completely silent/paused, WASAPI loopback stops firing
+    callbacks; we emit a lightweight silent PCM keepalive frame every 200ms so NAT/Wi-Fi
+    and iOS background URLSessionWebSocketTask never stall or idle-timeout.
+    """
     while not shutdown_event.is_set():
-        data = await audio_queue.get()
+        try:
+            data = await asyncio.wait_for(
+                audio_queue.get(), timeout=SILENCE_KEEPALIVE_INTERVAL
+            )
+        except asyncio.TimeoutError:
+            if not clients:
+                continue
+            ch = max(1, min(2, int(stream_channels or 2)))
+            data = b"\x00" * (SILENCE_KEEPALIVE_FRAMES * ch * 2)
 
         if not clients:
             continue
@@ -729,12 +857,34 @@ async def config_handler(request):
             "sampleRate": stream_rate,
             "channels": stream_channels,
             "deviceName": stream_device_name,
+            "hostname": SERVER_HOSTNAME,
+            "port": PORT,
             "micAvailable": mic_info["available"],
             "micRate": mic_info["rate"],
             "micChannels": mic_info["channels"],
             "micDeviceName": mic_info["deviceName"],
+            "nowPlaying": media_controller.get_cached_snapshot(),
         }
     )
+
+
+async def media_post_handler(request):
+    """HTTP fallback endpoint for remote media playback controls from iPhone."""
+    battery_monitor.register_client_ip(request.remote)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    action = str(payload.get("action") or "").strip().lower()
+    if not action:
+        return web.json_response({"ok": False, "error": "Missing 'action'"}, status=400)
+
+    result = await media_controller.execute_command(action)
+    status_code = 200 if "error" not in result else 400
+    if "nowPlaying" in result:
+        await notify_clients_now_playing(result["nowPlaying"])
+    return web.json_response(result, status=status_code)
 
 
 async def battery_get_handler(request):
@@ -768,6 +918,7 @@ def get_desktop_state():
         phone_mic_info = next(reversed(list(client_mic_info.values())), {})
     return {
         "url": server_url,
+        "hostname": SERVER_HOSTNAME,
         "deviceName": stream_device_name,
         "sampleRate": stream_rate,
         "channels": stream_channels,
@@ -782,6 +933,8 @@ def get_desktop_state():
         "micAvailable": mic_info["available"],
         "battery": battery_monitor.get_snapshot(),
         "audioSwitch": audio_switcher.get_cached_status(),
+        "autostart": autostart_manager.is_enabled(),
+        "nowPlaying": media_controller.get_cached_snapshot(),
     }
 
 
@@ -796,13 +949,14 @@ def request_server_stop():
 
 
 async def main():
-    global loop, async_stop_event, server_url
+    global loop, async_stop_event, server_url, ssl_context_ref, bound_lan_ip
 
     loop = asyncio.get_running_loop()
     async_stop_event = asyncio.Event()
     runner = None
     broadcast_task = None
     monitor_task = None
+    media_task = None
 
     _install_console_exit_handler()
 
@@ -814,11 +968,13 @@ async def main():
             await asyncio.to_thread(audio_switcher.switch_on_startup)
         setup_audio_devices(verbose=True)
         threading.Thread(target=mic_writer, daemon=True).start()
+        await media_controller.poll_now_playing()
 
         app = web.Application()
         app.router.add_get("/", index_handler)
         app.router.add_get("/worklet.js", worklet_handler)
         app.router.add_get("/config", config_handler)
+        app.router.add_post("/media", media_post_handler)
         app.router.add_get("/battery", battery_get_handler)
         app.router.add_post("/battery", battery_post_handler)
         app.router.add_get("/audio", websocket_handler)
@@ -828,14 +984,21 @@ async def main():
         await runner.setup()
 
         ip = get_local_ip()
+        bound_lan_ip = ip
         server_url = f"https://{ip}:{PORT}"
         cert_path, key_path = ensure_cert(ip)
 
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(cert_path, key_path)
+        ssl_context_ref = ssl_context
 
         site = web.TCPSite(runner, HOST, PORT, ssl_context=ssl_context)
         await site.start()
+
+        await lan_advertiser.start(
+            primary_ip=ip,
+            device_name_getter=lambda: stream_device_name,
+        )
 
         print()
         print("=" * 60)
@@ -853,11 +1016,14 @@ async def main():
 
         broadcast_task = asyncio.create_task(audio_broadcast_loop())
         monitor_task = asyncio.create_task(device_monitor_loop())
+        media_task = asyncio.create_task(media_monitor_loop())
 
         await async_stop_event.wait()
     finally:
+        ssl_context_ref = None
         battery_monitor.stop()
-        for task in (broadcast_task, monitor_task):
+        await lan_advertiser.stop()
+        for task in (broadcast_task, monitor_task, media_task):
             if task is not None:
                 task.cancel()
         for ws in list(clients):
@@ -870,10 +1036,82 @@ async def main():
         await asyncio.to_thread(audio_switcher.restore_on_exit)
 
 
+def _acquire_single_instance_handles():
+    """
+    Ensure only one GUI instance runs at a time on Windows.
+    If another instance is already active, signal its ShowEvent so its right-edge
+    Nightcord drawer slides out, and return (None, None, True).
+    """
+    if sys.platform != "win32":
+        return None, None, False
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateEventW.restype = c_void_p
+        kernel32.CreateEventW.argtypes = [c_void_p, ctypes.c_int, ctypes.c_int, c_wchar_p]
+        kernel32.CreateMutexW.restype = c_void_p
+        kernel32.CreateMutexW.argtypes = [c_void_p, ctypes.c_int, c_wchar_p]
+        kernel32.SetEvent.argtypes = [c_void_p]
+        kernel32.CloseHandle.argtypes = [c_void_p]
+
+        show_evt = kernel32.CreateEventW(
+            None, 0, 0, "Local\\NightcordAudioBridge_ShowEvent"
+        )
+        mutex = kernel32.CreateMutexW(
+            None, 0, "Local\\NightcordAudioBridge_Mutex"
+        )
+        already_running = ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+        if already_running:
+            if show_evt:
+                kernel32.SetEvent(show_evt)
+                kernel32.CloseHandle(show_evt)
+            if mutex:
+                kernel32.CloseHandle(mutex)
+            return None, None, True
+        return mutex, show_evt, False
+    except Exception:
+        return None, None, False
+
+
+def _close_win32_handle(handle):
+    if sys.platform == "win32" and handle:
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [c_void_p]
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
 def run_with_gui():
     from desktop_ui import DesktopPanel
 
+    mutex_h, show_evt_h, already_running = _acquire_single_instance_handles()
+    if already_running:
+        print("Nightcord Audio Bridge is already running; signaled existing drawer.")
+        return
+
     panel_ref = {}
+    handles = {"mutex": mutex_h, "show_evt": show_evt_h}
+
+    def release_instance_handles():
+        _close_win32_handle(handles.get("mutex"))
+        handles["mutex"] = None
+        _close_win32_handle(handles.get("show_evt"))
+        handles["show_evt"] = None
+
+    if sys.platform == "win32" and show_evt_h:
+        def _watch_show_signal():
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.WaitForSingleObject.argtypes = [c_void_p, DWORD]
+            kernel32.WaitForSingleObject.restype = DWORD
+            while not shutdown_event.is_set() and handles.get("show_evt"):
+                rc = kernel32.WaitForSingleObject(handles["show_evt"], 400)
+                if rc == 0:  # WAIT_OBJECT_0
+                    p = panel_ref.get("panel")
+                    if p is not None:
+                        p.request_show()
+
+        threading.Thread(target=_watch_show_signal, daemon=True).start()
 
     def server_worker():
         try:
@@ -891,6 +1129,7 @@ def run_with_gui():
         request_server_stop()
         server_thread.join(timeout=2.5)
         audio_switcher.restore_on_exit()
+        release_instance_handles()
 
     def on_restart():
         def restart_worker():
@@ -902,11 +1141,23 @@ def run_with_gui():
                 return
 
             audio_switcher.restore_on_exit()
+            release_instance_handles()
 
             try:
+                py_bin = (
+                    str(resolve_windowless_python())
+                    if sys.platform == "win32"
+                    else sys.executable
+                )
+                creation_flags = (
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    if sys.platform == "win32"
+                    else 0
+                )
                 subprocess.Popen(
-                    [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+                    [py_bin, str(Path(__file__).resolve()), *sys.argv[1:]],
                     cwd=str(BASE_DIR),
+                    creationflags=creation_flags,
                 )
             except Exception as e:
                 print("Failed to restart server:", e)
@@ -928,13 +1179,17 @@ def run_with_gui():
         on_select_airpods_fn=battery_monitor.select_airpods_candidate,
         on_reject_airpods_fn=battery_monitor.reject_current_airpods,
         on_unlock_airpods_fn=battery_monitor.unlock_airpods_binding,
+        on_toggle_autostart_fn=autostart_manager.toggle,
     )
     panel_ref["panel"] = panel
 
     signal.signal(signal.SIGINT, lambda *_: panel.request_quit())
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, lambda *_: panel.request_quit())
-    panel.run()
+    try:
+        panel.run()
+    finally:
+        release_instance_handles()
 
 
 if __name__ == "__main__":
