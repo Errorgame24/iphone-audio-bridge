@@ -313,7 +313,7 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
                     return buffer
                 }
                 guard result != .error, converted.frameLength > 0,
-                      let audioData = converted.audioBufferList.pointee.mData else { return }
+                      let audioData = converted.audioBufferList.pointee.mBuffers.mData else { return }
                 let bytesPerFrame = Int(outputFormat.streamDescription.pointee.mBytesPerFrame)
                 let packet = Data(bytes: audioData, count: Int(converted.frameLength) * bytesPerFrame)
                 continuation.yield(packet)
