@@ -968,7 +968,6 @@ async def main():
             await asyncio.to_thread(audio_switcher.switch_on_startup)
         setup_audio_devices(verbose=True)
         threading.Thread(target=mic_writer, daemon=True).start()
-        await media_controller.poll_now_playing()
 
         app = web.Application()
         app.router.add_get("/", index_handler)
@@ -995,11 +994,6 @@ async def main():
         site = web.TCPSite(runner, HOST, PORT, ssl_context=ssl_context)
         await site.start()
 
-        await lan_advertiser.start(
-            primary_ip=ip,
-            device_name_getter=lambda: stream_device_name,
-        )
-
         print()
         print("=" * 60)
         print(" iPhone Audio Bridge")
@@ -1014,6 +1008,12 @@ async def main():
         print()
         print("=" * 60)
 
+        asyncio.create_task(
+            lan_advertiser.start(
+                primary_ip=ip,
+                device_name_getter=lambda: stream_device_name,
+            )
+        )
         broadcast_task = asyncio.create_task(audio_broadcast_loop())
         monitor_task = asyncio.create_task(device_monitor_loop())
         media_task = asyncio.create_task(media_monitor_loop())

@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import ctypes
 import sys
 import threading
@@ -88,7 +89,6 @@ def send_virtual_media_key(vk_code: int) -> bool:
         sent = user32.SendInput(2, ctypes.byref(inputs), ctypes.sizeof(_INPUT))
         if sent == 2:
             return True
-        # Fallback to keybd_event if SendInput was blocked
         user32.keybd_event(vk_code, 0, KEYEVENTF_EXTENDEDKEY, 0)
         user32.keybd_event(vk_code, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
         return True
@@ -103,15 +103,28 @@ def _clean_app_name(source_id: str) -> str:
     if base.lower().endswith(".exe"):
         base = base[:-4]
     parts = base.replace("_", ".").split(".")
-    # Filter hex/publisher hashes when possible
-    meaningful = [p for p in parts if p and not (len(p) >= 10 and p.isalnum() and any(c.isdigit() for c in p))]
+    meaningful = [
+        p
+        for p in parts
+        if p and not (len(p) >= 10 and p.isalnum() and any(c.isdigit() for c in p))
+    ]
     return meaningful[-1] if meaningful else base
+
+
+def _init_mta_worker():
+    if sys.platform == "win32":
+        try:
+            # COINIT_MULTITHREADED = 0 so WinRT IAsyncOperation.get() never deadlocks with PyAudio/Tkinter STA
+            ctypes.windll.ole32.CoInitializeEx(None, 0)
+        except Exception:
+            pass
 
 
 class WindowsMediaController:
     """
     Bridge between iOS MPRemoteCommandCenter / MPNowPlayingInfoCenter and Windows GSMTC
     (GlobalSystemMediaTransportControlsSessionManager) with Win32 VK_MEDIA_* fallback.
+    Runs WinRT calls on a dedicated MTA worker thread so PyAudio/Tkinter STA threads never block.
     """
 
     VALID_ACTIONS = {"play", "pause", "toggle", "next", "prev", "stop"}
@@ -121,6 +134,11 @@ class WindowsMediaController:
         self._key_sender = key_sender
         self._manager = None
         self._fallback_playing = True
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="gsmtc-mta",
+            initializer=_init_mta_worker,
+        )
         self._snapshot = {
             "hasSession": False,
             "playing": True,
@@ -134,7 +152,7 @@ class WindowsMediaController:
         with self._lock:
             return dict(self._snapshot)
 
-    async def _get_manager(self):
+    def _get_manager_sync(self):
         if sys.platform != "win32":
             return None
         if self._manager is not None:
@@ -144,13 +162,22 @@ class WindowsMediaController:
                 GlobalSystemMediaTransportControlsSessionManager,
             )
 
-            self._manager = await asyncio.wait_for(
-                GlobalSystemMediaTransportControlsSessionManager.request_async(),
-                timeout=2.0,
+            self._manager = (
+                GlobalSystemMediaTransportControlsSessionManager.request_async().get()
             )
             return self._manager
         except Exception:
             self._manager = None
+            return None
+
+    async def _get_manager(self):
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(self._executor, self._get_manager_sync),
+                timeout=1.5,
+            )
+        except Exception:
             return None
 
     def _pick_session(self, manager):
@@ -175,6 +202,44 @@ class WindowsMediaController:
         except Exception:
             return None
 
+    def _read_session_snapshot_sync(self, session) -> dict:
+        playing = False
+        title = ""
+        artist = ""
+        album = ""
+        app_name = ""
+
+        try:
+            info = session.get_playback_info()
+            if info is not None:
+                playing = int(info.playback_status) == _GSMTC_STATUS_PLAYING
+        except Exception:
+            with self._lock:
+                playing = self._fallback_playing
+
+        try:
+            app_name = _clean_app_name(str(session.source_app_user_model_id or ""))
+        except Exception:
+            app_name = ""
+
+        try:
+            props = session.try_get_media_properties_async().get()
+            if props is not None:
+                title = str(props.title or "").strip()
+                artist = str(props.artist or "").strip()
+                album = str(props.album_title or "").strip()
+        except Exception:
+            pass
+
+        return {
+            "hasSession": True,
+            "playing": playing,
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "app": app_name,
+        }
+
     async def poll_now_playing(self) -> tuple[dict, bool]:
         """
         Query Windows GSMTC for active media metadata & playback status.
@@ -197,49 +262,38 @@ class WindowsMediaController:
                 self._snapshot = next_snap
                 return dict(next_snap), changed
 
-        playing = False
-        title = ""
-        artist = ""
-        album = ""
-        app_name = ""
-
+        loop = asyncio.get_running_loop()
         try:
-            info = session.get_playback_info()
-            if info is not None:
-                playing = int(info.playback_status) == _GSMTC_STATUS_PLAYING
-        except Exception:
-            playing = self._fallback_playing
-
-        try:
-            app_name = _clean_app_name(str(session.source_app_user_model_id or ""))
-        except Exception:
-            app_name = ""
-
-        try:
-            props = await asyncio.wait_for(
-                session.try_get_media_properties_async(),
-                timeout=1.2,
+            next_snap = await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._executor, self._read_session_snapshot_sync, session
+                ),
+                timeout=1.5,
             )
-            if props is not None:
-                title = str(props.title or "").strip()
-                artist = str(props.artist or "").strip()
-                album = str(props.album_title or "").strip()
         except Exception:
-            pass
+            return self.get_cached_snapshot(), False
 
         with self._lock:
-            self._fallback_playing = playing
-            next_snap = {
-                "hasSession": True,
-                "playing": playing,
-                "title": title,
-                "artist": artist,
-                "album": album,
-                "app": app_name,
-            }
+            self._fallback_playing = next_snap["playing"]
             changed = next_snap != self._snapshot
             self._snapshot = next_snap
             return dict(next_snap), changed
+
+    @staticmethod
+    def _invoke_session_action_sync(session, normalized: str) -> bool:
+        if normalized == "play":
+            return bool(session.try_play_async().get())
+        if normalized == "pause":
+            return bool(session.try_pause_async().get())
+        if normalized == "toggle":
+            return bool(session.try_toggle_play_pause_async().get())
+        if normalized == "next":
+            return bool(session.try_skip_next_async().get())
+        if normalized == "prev":
+            return bool(session.try_skip_previous_async().get())
+        if normalized == "stop":
+            return bool(session.try_stop_async().get())
+        return False
 
     async def execute_command(self, action: str) -> dict:
         """
@@ -255,37 +309,17 @@ class WindowsMediaController:
         handled_by_gsmtc = False
 
         if session is not None:
+            loop = asyncio.get_running_loop()
             try:
-                if normalized == "play":
-                    handled_by_gsmtc = bool(
-                        await asyncio.wait_for(session.try_play_async(), timeout=1.5)
-                    )
-                elif normalized == "pause":
-                    handled_by_gsmtc = bool(
-                        await asyncio.wait_for(session.try_pause_async(), timeout=1.5)
-                    )
-                elif normalized == "toggle":
-                    handled_by_gsmtc = bool(
-                        await asyncio.wait_for(
-                            session.try_toggle_play_pause_async(), timeout=1.5
-                        )
-                    )
-                elif normalized == "next":
-                    handled_by_gsmtc = bool(
-                        await asyncio.wait_for(
-                            session.try_skip_next_async(), timeout=1.5
-                        )
-                    )
-                elif normalized == "prev":
-                    handled_by_gsmtc = bool(
-                        await asyncio.wait_for(
-                            session.try_skip_previous_async(), timeout=1.5
-                        )
-                    )
-                elif normalized == "stop":
-                    handled_by_gsmtc = bool(
-                        await asyncio.wait_for(session.try_stop_async(), timeout=1.5)
-                    )
+                handled_by_gsmtc = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        self._executor,
+                        self._invoke_session_action_sync,
+                        session,
+                        normalized,
+                    ),
+                    timeout=1.5,
+                )
             except Exception:
                 handled_by_gsmtc = False
 
@@ -321,11 +355,9 @@ class WindowsMediaController:
                     self._key_sender, VK_MEDIA_STOP
                 )
 
-        # Give target media player a brief moment to update GSMTC playback status
         await asyncio.sleep(0.08)
         snapshot, _ = await self.poll_now_playing()
 
-        # Optimistically reflect explicit play/pause if GSMTC status lags slightly
         if normalized == "play" and not snapshot["playing"]:
             snapshot["playing"] = True
             with self._lock:

@@ -461,7 +461,7 @@ final class BridgeModel: NSObject, ObservableObject, URLSessionDelegate, URLSess
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 10
         cfg.shouldUseExtendedBackgroundIdleMode = true
-        cfg.networkServiceType = .av
+        cfg.networkServiceType = .video
         cfg.waitsForConnectivity = false
         return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
     }
