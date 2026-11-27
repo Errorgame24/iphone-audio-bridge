@@ -1,0 +1,78 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios-ipa.yml"
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Ensure XcodeGen is installed
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          fi
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Run iOS unit tests
+        run: |
+          SIM_ID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin).get("devices", {})
+          candidates = []
+          for runtime, devs in data.items():
+              if "iOS" not in runtime:
+                  continue
+              for d in devs:
+                  if d.get("isAvailable") and "iPhone" in d.get("name", ""):
+                      candidates.append((runtime, d["udid"], d["name"]))
+          candidates.sort(reverse=True)
+          if not candidates:
+              sys.exit("No available iPhone simulator found")
+          print(candidates[0][1])
+          ')
+          echo "Using simulator UDID: $SIM_ID"
+          xcodebuild test \
+            -project ios/AudioBridge.xcodeproj \
+            -scheme AudioBridge \
+            -destination "platform=iOS Simulator,id=$SIM_ID" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Build unsigned iOS app
+        run: >-
+          xcodebuild build
+          -project ios/AudioBridge.xcodeproj
+          -scheme AudioBridge
+          -configuration Release
+          -sdk iphoneos
+          -derivedDataPath "$RUNNER_TEMP/AudioBridgeDerivedData"
+          CODE_SIGNING_ALLOWED=NO
+          CODE_SIGNING_REQUIRED=NO
+          CODE_SIGN_IDENTITY=""
+
+      - name: Package IPA (compatible with AltServer / SideStore / Sideloadly / LiveContainer)
+        run: |
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$RUNNER_TEMP/AudioBridgeDerivedData/Build/Products/Release-iphoneos/AudioBridge.app" "$RUNNER_TEMP/ipa/Payload/"
+          codesign --force --deep --sign - --timestamp=none "$RUNNER_TEMP/ipa/Payload/AudioBridge.app"
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry "$GITHUB_WORKSPACE/AudioBridge-unsigned.ipa" Payload
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AudioBridge-unsigned-IPA
+          path: AudioBridge-unsigned.ipa
+          if-no-files-found: error

@@ -1,0 +1,52 @@
+name: AudioBridge
+options:
+  bundleIdPrefix: com.local.audiobridge
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+targets:
+  AudioBridge:
+    type: application
+    platform: iOS
+    sources:
+      - path: AudioBridge
+        excludes:
+          - Info.plist
+    info:
+      path: AudioBridge/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.local.audiobridge.client
+        PRODUCT_NAME: AudioBridge
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+  AudioBridgeTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: AudioBridge
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.local.audiobridge.client.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+schemes:
+  AudioBridge:
+    build:
+      targets:
+        AudioBridge: all
+        AudioBridgeTests: [test]
+    test:
+      targets:
+        - AudioBridgeTests

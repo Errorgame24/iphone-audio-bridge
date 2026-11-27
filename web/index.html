@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>iPhone Audio Bridge</title>
+
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #111;
+            color: white;
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            width: 90%;
+            max-width: 500px;
+            text-align: center;
+        }
+
+        button {
+            width: 100%;
+            padding: 18px;
+            margin-top: 12px;
+            border: 0;
+            border-radius: 14px;
+            background: #007aff;
+            color: white;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.15s ease, background 0.15s ease;
+        }
+
+        button.active,
+        button.mic-on {
+            background: #ff453a;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: default;
+        }
+
+        #status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 12px;
+            background: #222;
+            color: #aaa;
+            white-space: pre-line;
+            line-height: 1.45;
+        }
+
+        .ok {
+            color: #4cd964 !important;
+        }
+
+        .warn {
+            color: #ffd60a !important;
+        }
+
+        .error {
+            color: #ff453a !important;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>🎧 Audio Bridge</h1>
+
+    <p>Connect your Bluetooth headphones to the iPhone first.</p>
+
+    <button id="connect" disabled>Connect</button>
+    <button id="mic" disabled>🎤 Start microphone</button>
+
+    <div id="status">Loading...</div>
+
+</div>
+
+<script>
+
+const button = document.getElementById("connect");
+const micButton = document.getElementById("mic");
+const status = document.getElementById("status");
+
+const BUFFER_SIZE = 1024;
+const MAX_QUEUE = 6;
+const KEEP_QUEUE = 3;
+
+let audioActive = false;
+let audioContext = null;
+let playerNode = null;
+let usePlayerWorklet = false;
+let websocket = null;
+let audioElement = null;
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+
+let streamRate = 48000;
+let streamChannels = 2;
+let streamDeviceName = "";
+
+let micAvailable = false;
+let micRate = 48000;
+let micChannels = 2;
+
+// Fallback queue only used when AudioWorklet is unavailable
+let audioQueue = [];
+let currentBuffer = null;
+let currentPosition = 0;
+
+let micOn = false;
+let micStream = null;
+let micContext = null;
+let micSource = null;
+let micNode = null;
+let micSilentGain = null;
+let micSocket = null;
+
+
+function setStatus(text, className = "") {
+    status.textContent = text;
+    status.className = className;
+}
+
+
+function formatDeviceLabel() {
+    const dev = streamDeviceName ? `${streamDeviceName} · ` : "";
+    return `${dev}${streamRate} Hz`;
+}
+
+
+function refreshConnectedStatus() {
+    if (!audioActive) return;
+    const micSuffix = micOn ? "\n🎤 Microphone is streaming to PC" : "";
+    setStatus(`✓ Connected (${formatDeviceLabel()})${micSuffix}`, "ok");
+}
+
+
+function reportClientAudioInfo(socket) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+    const micTrack = micStream && micStream.getAudioTracks()[0];
+    const micSettings = micTrack && micTrack.getSettings ? micTrack.getSettings() : {};
+    socket.send(JSON.stringify({
+        type: "audio-info",
+        playbackSampleRate: audioContext ? audioContext.sampleRate : null,
+        micContextSampleRate: micContext ? micContext.sampleRate : null,
+        micInputSampleRate: micSettings.sampleRate || null
+    }));
+}
+
+
+fetch("/config")
+    .then((r) => r.json())
+    .then((cfg) => {
+        streamRate = cfg.sampleRate;
+        streamChannels = cfg.channels;
+        streamDeviceName = cfg.deviceName || "";
+        micAvailable = cfg.micAvailable;
+        micRate = cfg.micRate;
+        micChannels = cfg.micChannels;
+
+        button.disabled = false;
+        micButton.disabled = !micAvailable;
+
+        setStatus(
+            `Ready (${formatDeviceLabel()})` +
+            (micAvailable ? "" : "\nMicrophone unavailable: VB-Cable not found on the PC")
+        );
+    })
+    .catch((e) => {
+        setStatus("Could not load settings: " + e.message, "error");
+    });
+
+
+function resumeAudio() {
+    if (!audioActive) return;
+    if (audioContext && audioContext.state !== "running") {
+        audioContext.resume().catch(() => {});
+    }
+    if (audioElement && audioElement.paused) {
+        audioElement.play().catch(() => {});
+    }
+}
+
+document.addEventListener("visibilitychange", resumeAudio);
+
+
+/* ---------- PC audio -> iPhone ---------- */
+
+function updateMediaSession() {
+    if (!("mediaSession" in navigator)) return;
+    navigator.mediaSession.metadata = new MediaMetadata({
+        title: streamDeviceName || "PC audio",
+        artist: "Audio Bridge"
+    });
+    navigator.mediaSession.playbackState = audioActive ? "playing" : "none";
+    navigator.mediaSession.setActionHandler("play", resumeAudio);
+    navigator.mediaSession.setActionHandler("pause", () => stopAudio("Paused"));
+}
+
+
+function applyStreamConfig(cfg) {
+    if (cfg.sampleRate) streamRate = cfg.sampleRate;
+    if (cfg.channels) streamChannels = cfg.channels;
+    if (typeof cfg.deviceName === "string") streamDeviceName = cfg.deviceName;
+
+    if (usePlayerWorklet && playerNode) {
+        playerNode.port.postMessage({
+            type: "config",
+            sampleRate: streamRate,
+            channels: streamChannels
+        });
+    }
+
+    updateMediaSession();
+    if (websocket && websocket.readyState === WebSocket.OPEN) {
+        refreshConnectedStatus();
+        reportClientAudioInfo(websocket);
+    }
+}
+
+
+function clearPlaybackBuffer() {
+    audioQueue = [];
+    currentBuffer = null;
+    currentPosition = 0;
+    if (usePlayerWorklet && playerNode) {
+        playerNode.port.postMessage({ type: "clear" });
+    }
+}
+
+
+async function createPlayerGraph() {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: streamRate,
+        latencyHint: "interactive"
+    });
+
+    await audioContext.resume();
+    audioContext.onstatechange = resumeAudio;
+
+    const dest = audioContext.createMediaStreamDestination();
+
+    if (audioContext.audioWorklet) {
+        try {
+            await audioContext.audioWorklet.addModule("/worklet.js");
+            playerNode = new AudioWorkletNode(audioContext, "pcm-player-processor", {
+                numberOfInputs: 0,
+                numberOfOutputs: 1,
+                outputChannelCount: [2],
+                processorOptions: {
+                    sampleRate: streamRate,
+                    channels: streamChannels
+                }
+            });
+            usePlayerWorklet = true;
+        } catch (err) {
+            console.warn("AudioWorklet unavailable, falling back to ScriptProcessor:", err);
+            usePlayerWorklet = false;
+        }
+    }
+
+    if (!usePlayerWorklet) {
+        playerNode = audioContext.createScriptProcessor(BUFFER_SIZE, 0, 2);
+        playerNode.onaudioprocess = function (event) {
+            const output = event.outputBuffer;
+            const left = output.getChannelData(0);
+            const right = output.getChannelData(1);
+            const ch = streamChannels;
+
+            for (let i = 0; i < output.length; i++) {
+                if (!currentBuffer || currentPosition >= currentBuffer.length / ch) {
+                    if (audioQueue.length > 0) {
+                        currentBuffer = audioQueue.shift();
+                        currentPosition = 0;
+                    } else {
+                        left[i] = 0;
+                        right[i] = 0;
+                        continue;
+                    }
+                }
+
+                const index = currentPosition * ch;
+                left[i] = currentBuffer[index] / 32768;
+                right[i] = ch > 1 ? currentBuffer[index + 1] / 32768 : left[i];
+                currentPosition++;
+            }
+        };
+    }
+
+    playerNode.connect(dest);
+
+    audioElement = new Audio();
+    audioElement.srcObject = dest.stream;
+    audioElement.setAttribute("playsinline", "");
+    await audioElement.play();
+}
+
+
+function connectAudioSocket() {
+    if (!audioActive) return;
+
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    if (websocket) {
+        websocket.onopen = websocket.onmessage = websocket.onerror = websocket.onclose = null;
+        try { websocket.close(); } catch (_) {}
+        websocket = null;
+    }
+
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = protocol + "//" + location.host + "/audio";
+
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    websocket = ws;
+
+    ws.onopen = () => {
+        if (websocket !== ws || !audioActive) return;
+        reconnectDelay = 1000;
+        clearPlaybackBuffer();
+        refreshConnectedStatus();
+        reportClientAudioInfo(ws);
+    };
+
+    ws.onmessage = (event) => {
+        if (websocket !== ws || !audioActive) return;
+
+        if (typeof event.data === "string") {
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.type === "config") {
+                    applyStreamConfig(msg);
+                }
+            } catch (err) {
+                console.warn("Invalid config message:", err);
+            }
+            return;
+        }
+
+        if (usePlayerWorklet && playerNode) {
+            playerNode.port.postMessage(event.data, [event.data]);
+        } else {
+            audioQueue.push(new Int16Array(event.data));
+            if (audioQueue.length > MAX_QUEUE) {
+                audioQueue.splice(0, audioQueue.length - KEEP_QUEUE);
+            }
+        }
+    };
+
+    ws.onerror = (error) => {
+        console.error(error);
+    };
+
+    ws.onclose = () => {
+        if (websocket !== ws) return;
+        websocket = null;
+
+        if (!audioActive) return;
+
+        clearPlaybackBuffer();
+        const seconds = Math.round(reconnectDelay / 1000);
+        setStatus(`Connection lost. Reconnecting in ${seconds}s...`, "warn");
+
+        reconnectTimer = setTimeout(() => {
+            reconnectDelay = Math.min(5000, reconnectDelay * 2);
+            connectAudioSocket();
+        }, reconnectDelay);
+    };
+}
+
+
+async function startAudio() {
+    await stopAudio(null);
+
+    audioActive = true;
+    reconnectDelay = 1000;
+    button.disabled = true;
+    setStatus("Starting audio...");
+
+    try {
+        await createPlayerGraph();
+        updateMediaSession();
+
+        button.textContent = "Disconnect";
+        button.classList.add("active");
+        button.disabled = false;
+
+        setStatus("Connecting to the PC...");
+        connectAudioSocket();
+    } catch (error) {
+        console.error(error);
+        await stopAudio(null);
+        setStatus("Error: " + error.message, "error");
+    }
+}
+
+
+async function stopAudio(statusMessage = "Disconnected") {
+    audioActive = false;
+
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    if (websocket) {
+        websocket.onopen = websocket.onmessage = websocket.onerror = websocket.onclose = null;
+        try { websocket.close(); } catch (_) {}
+        websocket = null;
+    }
+
+    clearPlaybackBuffer();
+
+    if (playerNode) {
+        if (playerNode.onaudioprocess) playerNode.onaudioprocess = null;
+        try { playerNode.disconnect(); } catch (_) {}
+        playerNode = null;
+    }
+    usePlayerWorklet = false;
+
+    if (audioElement) {
+        try { audioElement.pause(); } catch (_) {}
+        audioElement.srcObject = null;
+        audioElement = null;
+    }
+
+    if (audioContext) {
+        audioContext.onstatechange = null;
+        try { await audioContext.close(); } catch (_) {}
+        audioContext = null;
+    }
+
+    if ("mediaSession" in navigator) {
+        navigator.mediaSession.playbackState = "none";
+    }
+
+    button.textContent = "Connect";
+    button.classList.remove("active");
+    button.disabled = false;
+
+    if (statusMessage !== null) {
+        setStatus(statusMessage);
+    }
+}
+
+
+button.addEventListener("click", async () => {
+    if (audioActive) {
+        await stopAudio("Disconnected");
+    } else {
+        await startAudio();
+    }
+});
+
+
+/* ---------- iPhone (AirPods) microphone -> PC ---------- */
+
+async function startMic() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error(
+            "The microphone requires HTTPS. Open the page via https://"
+        );
+    }
+
+    micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+        }
+    });
+
+    micContext = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: micRate,
+        latencyHint: "interactive"
+    });
+
+    await micContext.resume();
+
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(protocol + "//" + location.host + "/mic");
+    ws.binaryType = "arraybuffer";
+    micSocket = ws;
+
+    await new Promise((resolve, reject) => {
+        ws.onopen = resolve;
+        ws.onerror = () => reject(new Error("Microphone WebSocket error"));
+    });
+    reportClientAudioInfo(ws);
+
+    ws.onclose = () => {
+        if (micSocket === ws && micOn) {
+            stopMic();
+            if (audioActive) {
+                refreshConnectedStatus();
+            } else {
+                setStatus("Microphone connection closed", "warn");
+            }
+        }
+    };
+
+    micSource = micContext.createMediaStreamSource(micStream);
+    micSilentGain = micContext.createGain();
+    micSilentGain.gain.value = 0;
+
+    let workletReady = false;
+    if (micContext.audioWorklet) {
+        try {
+            await micContext.audioWorklet.addModule("/worklet.js");
+            micNode = new AudioWorkletNode(micContext, "pcm-mic-processor", {
+                numberOfInputs: 1,
+                numberOfOutputs: 1,
+                outputChannelCount: [1],
+                processorOptions: {
+                    targetSampleRate: micRate,
+                    targetChannels: micChannels
+                }
+            });
+            micNode.port.onmessage = (event) => {
+                if (micSocket && micSocket.readyState === WebSocket.OPEN && micSocket.bufferedAmount < 20000) {
+                    micSocket.send(event.data);
+                }
+            };
+            workletReady = true;
+        } catch (err) {
+            console.warn("Mic AudioWorklet unavailable, falling back to ScriptProcessor:", err);
+        }
+    }
+
+    if (!workletReady) {
+        micNode = micContext.createScriptProcessor(1024, 1, 1);
+        micNode.onaudioprocess = (event) => {
+            const input = event.inputBuffer.getChannelData(0);
+            const out = new Int16Array(input.length * micChannels);
+
+            for (let i = 0; i < input.length; i++) {
+                const s = Math.max(-1, Math.min(1, input[i]));
+                const v = s < 0 ? s * 32768 : s * 32767;
+                for (let c = 0; c < micChannels; c++) {
+                    out[i * micChannels + c] = v;
+                }
+            }
+
+            if (micSocket && micSocket.readyState === WebSocket.OPEN && micSocket.bufferedAmount < 20000) {
+                micSocket.send(out.buffer);
+            }
+        };
+    }
+
+    micSource.connect(micNode);
+    micNode.connect(micSilentGain);
+    micSilentGain.connect(micContext.destination);
+}
+
+
+function stopMic() {
+    micOn = false;
+
+    if (micNode) {
+        if (micNode.onaudioprocess) micNode.onaudioprocess = null;
+        if (micNode.port) micNode.port.onmessage = null;
+        try { micNode.disconnect(); } catch (_) {}
+    }
+    if (micSilentGain) {
+        try { micSilentGain.disconnect(); } catch (_) {}
+    }
+    if (micSource) {
+        try { micSource.disconnect(); } catch (_) {}
+    }
+    if (micStream) {
+        micStream.getTracks().forEach((t) => t.stop());
+    }
+    if (micContext) {
+        micContext.close().catch(() => {});
+    }
+    if (micSocket) {
+        micSocket.onopen = micSocket.onerror = micSocket.onclose = null;
+        try { micSocket.close(); } catch (_) {}
+    }
+
+    micNode = micSilentGain = micSource = micStream = micContext = micSocket = null;
+
+    micButton.textContent = "🎤 Start microphone";
+    micButton.classList.remove("mic-on");
+}
+
+
+micButton.addEventListener("click", async () => {
+    if (micOn) {
+        stopMic();
+        if (audioActive) {
+            refreshConnectedStatus();
+        } else {
+            setStatus("Microphone stopped");
+        }
+        return;
+    }
+
+    micButton.disabled = true;
+
+    try {
+        await startMic();
+        micOn = true;
+
+        micButton.textContent = "🎤 Stop microphone";
+        micButton.classList.add("mic-on");
+
+        if (audioActive) {
+            refreshConnectedStatus();
+        } else {
+            setStatus("✓ Microphone is on", "ok");
+        }
+    } catch (error) {
+        console.error(error);
+        stopMic();
+        setStatus("Microphone error: " + error.message, "error");
+    }
+
+    micButton.disabled = false;
+});
+
+</script>
+
+</body>
+</html>

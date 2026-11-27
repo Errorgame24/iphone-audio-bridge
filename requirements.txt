@@ -1,0 +1,6 @@
+aiohttp>=3.10
+PyAudioWPatch
+cryptography
+bleak
+pystray
+pillow
