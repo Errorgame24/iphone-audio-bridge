@@ -4,9 +4,11 @@ venv/
 __pycache__/
 *.pyc
 
-# Self-signed TLS certificate generated on first run (NEVER commit the private key)
+# Self-signed TLS certificate & local audio restore state generated at runtime
 cert.pem
 key.pem
+.audio_switcher_state.json
+.airpods_binding.json
 
 # OS / editor
 .DS_Store

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import plistlib
 import re
@@ -9,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from pathlib import Path
 from uuid import UUID
 
 APPLE_COMPANY_ID = 0x004C
@@ -136,6 +138,7 @@ def parse_airpods_advertisement(payload: bytes, rssi: int):
     return {
         "modelId": f"0x{model_id:04X}",
         "model": model_name,
+        "color": int(payload[9]),
         "isSingle": is_single,
         "left": left,
         "right": right,
@@ -154,15 +157,17 @@ def parse_airpods_advertisement(payload: bytes, rssi: int):
 class BatteryMonitor:
     """
     Background battery monitor on Windows:
-    1. Passively listens for Apple Continuity 0x07 BLE broadcasts from AirPods / Beats.
+    1. Passively listens for Apple Continuity 0x07 BLE broadcasts from AirPods / Beats,
+       locking onto the user's headphones to prevent nearby bystander headphones from hijacking.
     2. Reads iPhone battery silently via:
        - Tier 1: Apple Lockdown (usbmuxd USB / Wi-Fi Sync + Hotspot/LAN TCP 62078, 1% precision)
        - Tier 2: Windows BLE GATT Battery Service (0x180F / 0x2A19)
        - Tier 3: Optional HTTP push webhook (/battery)
     """
 
-    def __init__(self):
+    def __init__(self, state_file: Path = None):
         self._lock = threading.Lock()
+        self._state_file = Path(state_file) if state_file else None
         self._stop_event = False
         self._stop_async_event = None
         self._refresh_event = None
@@ -181,11 +186,37 @@ class BatteryMonitor:
         self._preferred_host_id = ""
         self._ssl_ctx_cache = {}  # host_id -> ssl.SSLContext
 
-        self._airpods = {
+        # AirPods identity lock & nearby candidate table
+        self._bound_model_id = ""
+        self._bound_color = None
+        self._bound_model = ""
+        self._bound_name = ""
+        self._bound_is_single = False
+        self._active_airpods_key = ""
+        self._ignored_airpods_keys = set()
+        self._airpods_candidates = {}  # cand_key -> candidate dict
+
+        self._airpods = self._empty_airpods_dict()
+        self._load_airpods_binding()
+
+        self._iphone = {
+            "state": "unpaired",  # unpaired | needs_ble_pair | pairing | disconnected | connected | shortcut | bt_off
+            "name": "",
+            "level": None,
+            "charging": None,
+            "source": "",
+            "updatedAt": None,
+            "hint": "正在自动检测连接的 iPhone...",
+        }
+
+    @staticmethod
+    def _empty_airpods_dict():
+        return {
             "online": False,
             "model": "",
             "name": "",
             "modelId": "",
+            "color": None,
             "isSingle": False,
             "left": None,
             "right": None,
@@ -202,15 +233,85 @@ class BatteryMonitor:
             "updatedAt": None,
         }
 
-        self._iphone = {
-            "state": "unpaired",  # unpaired | needs_ble_pair | pairing | disconnected | connected | shortcut | bt_off
-            "name": "",
-            "level": None,
-            "charging": None,
-            "source": "",
-            "updatedAt": None,
-            "hint": "正在自动检测连接的 iPhone...",
+    def _load_airpods_binding(self):
+        if not self._state_file:
+            return
+        try:
+            if not self._state_file.exists():
+                return
+            data = json.loads(self._state_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            model_id = str(data.get("boundModelId") or "").strip()
+            if not model_id:
+                return
+            self._bound_model_id = model_id
+            raw_color = data.get("boundColor")
+            self._bound_color = int(raw_color) if isinstance(raw_color, int) else None
+            self._bound_model = str(data.get("boundModel") or "").strip()
+            self._bound_name = str(data.get("boundName") or "").strip()
+            self._bound_is_single = bool(data.get("boundIsSingle", False))
+            self._airpods.update(
+                modelId=self._bound_model_id,
+                model=self._bound_model,
+                name=self._bound_name,
+                color=self._bound_color,
+                isSingle=self._bound_is_single,
+            )
+        except Exception:
+            pass
+
+    def _save_airpods_binding_unlocked(self):
+        if not self._state_file:
+            return
+        payload = {
+            "boundModelId": self._bound_model_id,
+            "boundColor": self._bound_color,
+            "boundModel": self._bound_model,
+            "boundName": self._bound_name,
+            "boundIsSingle": self._bound_is_single,
         }
+        try:
+            self._state_file.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def _build_candidates_snapshot_unlocked(self, now: float) -> list:
+        cutoff = now - 75.0
+        stale_keys = [
+            k for k, v in self._airpods_candidates.items() if v["updatedAt"] < cutoff
+        ]
+        for k in stale_keys:
+            self._airpods_candidates.pop(k, None)
+
+        items = []
+        for k, c in self._airpods_candidates.items():
+            items.append(
+                {
+                    "key": k,
+                    "modelId": c["modelId"],
+                    "model": c["model"],
+                    "name": c["name"],
+                    "color": c["color"],
+                    "isSingle": c["isSingle"],
+                    "left": c["left"],
+                    "right": c["right"],
+                    "case": c["case"],
+                    "single": c["single"],
+                    "rssi": int(round(c["rssi"])) if c["rssi"] is not None else None,
+                    "ignored": k in self._ignored_airpods_keys,
+                    "isCurrent": bool(self._active_airpods_key and k == self._active_airpods_key),
+                }
+            )
+        items.sort(
+            key=lambda x: (
+                0 if x["isCurrent"] else (2 if x["ignored"] else 1),
+                -(x["rssi"] if x["rssi"] is not None else -100),
+            )
+        )
+        return items
 
     def get_snapshot(self):
         now = time.time()
@@ -218,6 +319,10 @@ class BatteryMonitor:
             ap = dict(self._airpods)
             if ap["updatedAt"] is not None and (now - ap["updatedAt"]) > AIRPODS_STALE_SECONDS:
                 ap["online"] = False
+            ap["locked"] = bool(self._bound_model_id)
+            ap["lockedModel"] = self._bound_model or ap["model"]
+            ap["activeKey"] = self._active_airpods_key
+            ap["candidates"] = self._build_candidates_snapshot_unlocked(now)
             ph = dict(self._iphone)
         return {"airpods": ap, "iphone": ph, "timestamp": now}
 
@@ -272,66 +377,265 @@ class BatteryMonitor:
                 hint="通过快捷指令 Webhook 同步",
             )
 
+    def _bind_to_candidate_unlocked(self, cand: dict):
+        self._bound_model_id = cand["modelId"]
+        self._bound_color = cand["color"]
+        self._bound_model = cand["model"]
+        if cand["name"]:
+            self._bound_name = cand["name"]
+        self._bound_is_single = cand["isSingle"]
+        self._active_airpods_key = cand["key"]
+        self._save_airpods_binding_unlocked()
+
+    def _apply_candidate_to_airpods_unlocked(self, cand: dict, now: float):
+        prev_time = self._airpods["updatedAt"]
+        prev_model = self._airpods["modelId"]
+        same_device = cand["modelId"] == prev_model
+
+        last_case = (
+            cand["case"]
+            if cand["case"] is not None
+            else (self._airpods["lastCase"] if same_device else None)
+        )
+
+        # Keep previous L/R reading briefly if one pod momentarily stops advertising
+        left = cand["left"]
+        right = cand["right"]
+        if left is None and prev_time and (now - prev_time) < 8.0 and same_device:
+            left = self._airpods["left"]
+        if right is None and prev_time and (now - prev_time) < 8.0 and same_device:
+            right = self._airpods["right"]
+
+        resolved_name = cand["name"] or (
+            self._airpods["name"] if same_device else self._bound_name
+        )
+        if resolved_name and cand["modelId"] == self._bound_model_id:
+            if resolved_name != self._bound_name:
+                self._bound_name = resolved_name
+                self._save_airpods_binding_unlocked()
+
+        self._airpods.update(
+            online=True,
+            model=cand["model"],
+            name=resolved_name,
+            modelId=cand["modelId"],
+            color=cand["color"],
+            isSingle=cand["isSingle"],
+            left=left,
+            right=right,
+            case=cand["case"],
+            lastCase=last_case,
+            single=cand["single"],
+            leftCharging=cand["leftCharging"],
+            rightCharging=cand["rightCharging"],
+            caseCharging=cand["caseCharging"],
+            singleCharging=cand["singleCharging"],
+            leftInEar=cand["leftInEar"],
+            rightInEar=cand["rightInEar"],
+            rssi=int(round(cand["rssi"])) if cand["rssi"] is not None else None,
+            updatedAt=now,
+        )
+
+    def _max_pod_jump_unlocked(self, cand: dict) -> int:
+        jumps = []
+        for field in ("left", "right", "single"):
+            old_v = self._airpods.get(field)
+            new_v = cand.get(field)
+            if old_v is not None and new_v is not None:
+                jumps.append(abs(int(new_v) - int(old_v)))
+        return max(jumps) if jumps else 0
+
+    def _should_accept_airpods_unlocked(self, cand: dict, now: float) -> bool:
+        key = cand["key"]
+        rssi = cand["rssi"]
+
+        if key in self._ignored_airpods_keys:
+            return False
+
+        # Case 1: Not bound to any headphone yet -> acquire only close, consistent desk-range signals
+        if not self._bound_model_id:
+            if rssi is not None and rssi < -66:
+                return False
+            if cand["address"] and rssi is not None and rssi < -58 and cand["hits"] < 2:
+                return False
+            # Defer if a noticeably stronger nearby headphone is broadcasting at the same moment
+            if rssi is not None:
+                for other_k, other in self._airpods_candidates.items():
+                    if (
+                        other_k != key
+                        and other_k not in self._ignored_airpods_keys
+                        and (now - other["updatedAt"]) < 4.0
+                        and other["rssi"] is not None
+                        and other["rssi"] > rssi + 6
+                    ):
+                        return False
+            self._bind_to_candidate_unlocked(cand)
+            return True
+
+        # Case 2: Bound to the user's headphone -> strictly enforce model & color
+        if cand["modelId"] != self._bound_model_id:
+            return False
+        if (
+            self._bound_color is not None
+            and cand["color"] is not None
+            and cand["color"] != self._bound_color
+        ):
+            return False
+        if rssi is not None and rssi < -76:
+            return False
+
+        # Same active BLE MAC session -> accept directly
+        if not self._active_airpods_key or key == self._active_airpods_key:
+            self._active_airpods_key = key
+            return True
+
+        # Different BLE MAC with identical model & color:
+        # Either a bystander has the exact same headphone model, or our AirPods rotated RPA MAC (~15m)
+        prev_time = self._airpods["updatedAt"]
+        prev_rssi = self._airpods["rssi"]
+
+        if prev_time is not None and (now - prev_time) < 40.0:
+            # Our active MAC is still broadcasting live; block concurrent bystander MACs
+            if (
+                cand["hits"] >= 3
+                and rssi is not None
+                and prev_rssi is not None
+                and rssi >= -52
+                and rssi >= prev_rssi + 15
+            ):
+                self._active_airpods_key = key
+                return True
+            return False
+
+        # Previous MAC went silent (>= 40s): verify desk proximity + battery continuity before RPA handover
+        if rssi is not None and rssi < -68:
+            return False
+        if prev_time is not None and (now - prev_time) < 900.0:
+            if self._max_pod_jump_unlocked(cand) > 20:
+                if not (rssi is not None and rssi >= -52 and cand["hits"] >= 2):
+                    return False
+
+        self._active_airpods_key = key
+        return True
+
+    def select_airpods_candidate(self, key: str):
+        """Manually lock onto a specific nearby AirPods/Beats candidate chosen by the user."""
+        if not key:
+            return
+        now = time.time()
+        with self._lock:
+            self._ignored_airpods_keys.discard(key)
+            cand = self._airpods_candidates.get(key)
+            if not cand:
+                return
+            self._airpods = self._empty_airpods_dict()
+            self._bind_to_candidate_unlocked(cand)
+            self._apply_candidate_to_airpods_unlocked(cand, now)
+
+    def reject_current_airpods(self):
+        """Blacklist the currently displayed bystander headphone and switch/re-scan for the user's own."""
+        now = time.time()
+        with self._lock:
+            if self._active_airpods_key:
+                self._ignored_airpods_keys.add(self._active_airpods_key)
+            self._bound_model_id = ""
+            self._bound_color = None
+            self._bound_model = ""
+            self._bound_name = ""
+            self._bound_is_single = False
+            self._active_airpods_key = ""
+            self._airpods = self._empty_airpods_dict()
+            self._save_airpods_binding_unlocked()
+
+            # Immediately pick the strongest remaining desk-range candidate if one is already present
+            remaining = [
+                c
+                for k, c in self._airpods_candidates.items()
+                if k not in self._ignored_airpods_keys
+                and (now - c["updatedAt"]) < 25.0
+                and (c["rssi"] is None or c["rssi"] >= -66)
+            ]
+            if remaining:
+                remaining.sort(
+                    key=lambda c: c["rssi"] if c["rssi"] is not None else -100,
+                    reverse=True,
+                )
+                best = remaining[0]
+                self._bind_to_candidate_unlocked(best)
+                self._apply_candidate_to_airpods_unlocked(best, now)
+
+    def unlock_airpods_binding(self):
+        """Clear persistent headphone lock so a newly paired headphone model can be auto-detected."""
+        with self._lock:
+            self._bound_model_id = ""
+            self._bound_color = None
+            self._bound_model = ""
+            self._bound_name = ""
+            self._bound_is_single = False
+            self._active_airpods_key = ""
+            self._ignored_airpods_keys.clear()
+            self._airpods = self._empty_airpods_dict()
+            self._save_airpods_binding_unlocked()
+
     def _on_airpods_packet(self, parsed: dict):
         now = time.time()
-        rssi = parsed["rssi"]
+        raw_rssi = parsed.get("rssi")
 
-        # Filter out very weak packets from distant neighbors
-        if rssi is not None and rssi < -80:
+        # Filter out very weak background packets from distant rooms
+        if raw_rssi is not None and raw_rssi < -78:
             return
 
+        address = (parsed.get("address") or "").strip().upper()
+        color = parsed.get("color")
+        cand_key = address or f"{parsed['modelId']}:{color if color is not None else 'x'}"
+
         with self._lock:
-            prev_time = self._airpods["updatedAt"]
-            prev_rssi = self._airpods["rssi"]
-            prev_model = self._airpods["modelId"]
+            prev_cand = self._airpods_candidates.get(cand_key)
+            if prev_cand and (now - prev_cand["updatedAt"]) <= 12.0:
+                hits = prev_cand["hits"] + 1
+                if raw_rssi is not None and prev_cand["rssi"] is not None:
+                    smoothed_rssi = 0.6 * raw_rssi + 0.4 * prev_cand["rssi"]
+                else:
+                    smoothed_rssi = raw_rssi if raw_rssi is not None else prev_cand["rssi"]
+            else:
+                hits = 1
+                smoothed_rssi = float(raw_rssi) if raw_rssi is not None else None
 
-            if (
-                prev_time is not None
-                and (now - prev_time) < 12.0
-                and prev_model
-                and parsed["modelId"] != prev_model
-                and prev_rssi is not None
-                and rssi is not None
-                and rssi < prev_rssi - 12
-            ):
-                # Ignore weaker bystander AirPods when our primary pair is active
+            adv_name = (parsed.get("name") or "").strip()
+            if not adv_name and prev_cand:
+                adv_name = prev_cand["name"]
+
+            cand = {
+                "key": cand_key,
+                "address": address,
+                "modelId": parsed["modelId"],
+                "model": parsed["model"],
+                "color": color,
+                "name": adv_name,
+                "isSingle": parsed["isSingle"],
+                "left": parsed["left"],
+                "right": parsed["right"],
+                "case": parsed["case"],
+                "single": parsed["single"],
+                "leftCharging": parsed["leftCharging"],
+                "rightCharging": parsed["rightCharging"],
+                "caseCharging": parsed["caseCharging"],
+                "singleCharging": parsed["singleCharging"],
+                "leftInEar": parsed["leftInEar"],
+                "rightInEar": parsed["rightInEar"],
+                "rssi": smoothed_rssi,
+                "hits": hits,
+                "updatedAt": now,
+            }
+            self._airpods_candidates[cand_key] = cand
+
+            if len(self._airpods_candidates) > 24:
+                self._build_candidates_snapshot_unlocked(now)
+
+            if not self._should_accept_airpods_unlocked(cand, now):
                 return
 
-            if prev_time is None and rssi is not None and rssi < -75:
-                return
-
-            last_case = parsed["case"] if parsed["case"] is not None else self._airpods["lastCase"]
-
-            # Keep previous L/R reading briefly if one pod momentarily stops advertising
-            left = parsed["left"]
-            right = parsed["right"]
-            if left is None and prev_time and (now - prev_time) < 8.0 and parsed["modelId"] == prev_model:
-                left = self._airpods["left"]
-            if right is None and prev_time and (now - prev_time) < 8.0 and parsed["modelId"] == prev_model:
-                right = self._airpods["right"]
-
-            self._airpods.update(
-                online=True,
-                model=parsed["model"],
-                name=parsed.get("name") or (
-                    self._airpods["name"] if parsed["modelId"] == prev_model else ""
-                ),
-                modelId=parsed["modelId"],
-                isSingle=parsed["isSingle"],
-                left=left,
-                right=right,
-                case=parsed["case"],
-                lastCase=last_case,
-                single=parsed["single"],
-                leftCharging=parsed["leftCharging"],
-                rightCharging=parsed["rightCharging"],
-                caseCharging=parsed["caseCharging"],
-                singleCharging=parsed["singleCharging"],
-                leftInEar=parsed["leftInEar"],
-                rightInEar=parsed["rightInEar"],
-                rssi=rssi,
-                updatedAt=now,
-            )
+            self._apply_candidate_to_airpods_unlocked(cand, now)
 
     async def _scanner_loop(self):
         from bleak import BleakScanner
@@ -347,6 +651,7 @@ class BatteryMonitor:
             if payload[0] == 0x07:
                 parsed = parse_airpods_advertisement(payload, advertisement_data.rssi)
                 if parsed is not None:
+                    parsed["address"] = getattr(device, "address", "") or ""
                     parsed["name"] = (
                         getattr(advertisement_data, "local_name", None)
                         or getattr(device, "name", None)

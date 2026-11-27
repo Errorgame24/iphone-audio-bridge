@@ -1,8 +1,42 @@
+import tempfile
+from pathlib import Path
 import unittest
 
 from battery_monitor import BatteryMonitor
 from desktop_ui import DesktopPanel
 from server import _validated_sample_rate
+
+
+def _make_pkt(
+    model_id="0x2014",
+    model="AirPods Pro 2",
+    address="AA:AA:AA:AA:AA:01",
+    color=0,
+    left=80,
+    right=80,
+    case=60,
+    rssi=-50,
+    name="",
+):
+    return {
+        "modelId": model_id,
+        "model": model,
+        "address": address,
+        "color": color,
+        "name": name,
+        "isSingle": False,
+        "left": left,
+        "right": right,
+        "case": case,
+        "single": None,
+        "leftCharging": False,
+        "rightCharging": False,
+        "caseCharging": False,
+        "singleCharging": False,
+        "leftInEar": True,
+        "rightInEar": True,
+        "rssi": rssi,
+    }
 
 
 class DesktopStatusTests(unittest.TestCase):
@@ -15,24 +49,7 @@ class DesktopStatusTests(unittest.TestCase):
 
     def test_airpods_snapshot_contains_advertised_name(self):
         monitor = BatteryMonitor()
-        packet = {
-            "model": "AirPods Pro 3",
-            "modelId": "0x2027",
-            "name": "My AirPods",
-            "isSingle": False,
-            "left": 80,
-            "right": 70,
-            "case": 60,
-            "lastCase": 60,
-            "single": None,
-            "leftCharging": False,
-            "rightCharging": False,
-            "caseCharging": False,
-            "singleCharging": False,
-            "leftInEar": True,
-            "rightInEar": True,
-            "rssi": -50,
-        }
+        packet = _make_pkt(model_id="0x2027", model="AirPods Pro 3", name="My AirPods", right=70)
 
         monitor._on_airpods_packet(packet)
         self.assertEqual(monitor.get_snapshot()["airpods"]["name"], "My AirPods")
@@ -40,6 +57,78 @@ class DesktopStatusTests(unittest.TestCase):
         packet["name"] = ""
         monitor._on_airpods_packet(packet)
         self.assertEqual(monitor.get_snapshot()["airpods"]["name"], "My AirPods")
+
+    def test_bystander_different_or_same_model_airpods_do_not_hijack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / ".airpods_binding.json"
+            monitor = BatteryMonitor(state_file=state_file)
+
+            # Distant neighbor (-72 dBm) is ignored before binding
+            monitor._on_airpods_packet(
+                _make_pkt(model_id="0x2019", model="AirPods 4", address="11:22:33:44:55:66", left=30, right=30, rssi=-72)
+            )
+            self.assertFalse(monitor.get_snapshot()["airpods"]["online"])
+
+            # User opens their own AirPods Pro 2 at desk (-50 dBm) -> auto-binds
+            monitor._on_airpods_packet(
+                _make_pkt(model_id="0x2014", model="AirPods Pro 2", address="AA:AA:AA:AA:AA:01", left=90, right=80, rssi=-50)
+            )
+            ap = monitor.get_snapshot()["airpods"]
+            self.assertTrue(ap["locked"])
+            self.assertEqual(ap["left"], 90)
+            self.assertEqual(ap["model"], "AirPods Pro 2")
+
+            # Bystander right next to PC (-46 dBm) opens AirPods 4 -> blocked by model lock
+            monitor._on_airpods_packet(
+                _make_pkt(model_id="0x2019", model="AirPods 4", address="22:22:22:22:22:22", left=20, right=20, rssi=-46)
+            )
+            self.assertEqual(monitor.get_snapshot()["airpods"]["model"], "AirPods Pro 2")
+            self.assertEqual(monitor.get_snapshot()["airpods"]["left"], 90)
+
+            # Second bystander has the EXACT same AirPods Pro 2 (different MAC) -> blocked while active
+            monitor._on_airpods_packet(
+                _make_pkt(model_id="0x2014", model="AirPods Pro 2", address="BB:BB:BB:BB:BB:02", left=30, right=40, rssi=-56)
+            )
+            self.assertEqual(monitor.get_snapshot()["airpods"]["left"], 90)
+
+            # Simulate user's AirPods going silent for 60s (lid closed in ears); bystander with discontinuous battery still blocked
+            monitor._airpods["updatedAt"] -= 60.0
+            monitor._on_airpods_packet(
+                _make_pkt(model_id="0x2014", model="AirPods Pro 2", address="BB:BB:BB:BB:BB:02", left=30, right=40, rssi=-62)
+            )
+            self.assertEqual(monitor.get_snapshot()["airpods"]["left"], 90)
+
+            # Simulate user's own AirPods rotating BLE RPA MAC with continuous battery (80%/80%) -> accepted
+            monitor._on_airpods_packet(
+                _make_pkt(model_id="0x2014", model="AirPods Pro 2", address="CC:CC:CC:CC:CC:03", left=80, right=80, rssi=-58)
+            )
+            self.assertEqual(monitor.get_snapshot()["airpods"]["left"], 80)
+            self.assertEqual(monitor.get_snapshot()["airpods"]["activeKey"], "CC:CC:CC:CC:CC:03")
+
+            # Restarting BatteryMonitor reloads persistent lock and still blocks other models before lid open
+            monitor2 = BatteryMonitor(state_file=state_file)
+            monitor2._on_airpods_packet(
+                _make_pkt(model_id="0x2019", model="AirPods 4", address="33:33:33:33:33:33", left=50, right=50, rssi=-48)
+            )
+            self.assertFalse(monitor2.get_snapshot()["airpods"]["online"])
+            self.assertEqual(monitor2.get_snapshot()["airpods"]["model"], "AirPods Pro 2")
+
+    def test_reject_current_airpods_blacklists_and_switches_to_other_candidate(self):
+        monitor = BatteryMonitor()
+        # Suppose roommate's pair was acquired first, and user's pair is also nearby
+        monitor._on_airpods_packet(
+            _make_pkt(model_id="0x2019", model="AirPods 4", address="11:11:11:11:11:11", left=40, right=40, rssi=-52)
+        )
+        monitor._on_airpods_packet(
+            _make_pkt(model_id="0x2014", model="AirPods Pro 2", address="AA:AA:AA:AA:AA:01", left=90, right=90, rssi=-54)
+        )
+        self.assertEqual(monitor.get_snapshot()["airpods"]["model"], "AirPods 4")
+
+        # User clicks "这不是我的耳机" -> blacklists AirPods 4 MAC and switches to AirPods Pro 2
+        monitor.reject_current_airpods()
+        ap = monitor.get_snapshot()["airpods"]
+        self.assertEqual(ap["model"], "AirPods Pro 2")
+        self.assertEqual(ap["left"], 90)
 
     def test_battery_text_does_not_add_wearing_ear_icon(self):
         text, _ = DesktopPanel._format_pod_value(None, 85, False, True)

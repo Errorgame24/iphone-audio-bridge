@@ -190,12 +190,22 @@ class DesktopPanel:
         on_quit_fn,
         on_pair_iphone_fn=None,
         on_restart_fn=None,
+        on_switch_virtual_fn=None,
+        on_restore_audio_fn=None,
+        on_select_airpods_fn=None,
+        on_reject_airpods_fn=None,
+        on_unlock_airpods_fn=None,
     ):
         self._get_state = get_state_fn
         self._on_refresh_iphone = on_refresh_iphone_fn
         self._on_quit = on_quit_fn
         self._on_pair_iphone = on_pair_iphone_fn
         self._on_restart = on_restart_fn
+        self._on_switch_virtual = on_switch_virtual_fn
+        self._on_restore_audio = on_restore_audio_fn
+        self._on_select_airpods = on_select_airpods_fn
+        self._on_reject_airpods = on_reject_airpods_fn
+        self._on_unlock_airpods = on_unlock_airpods_fn
 
         self._cmd_queue = queue.Queue()
         self._always_on_top = False
@@ -203,6 +213,8 @@ class DesktopPanel:
         self._last_tooltip = ""
         self._last_icon_state = None
         self._copy_reset_after = None
+        self._switch_reset_after = None
+        self._switch_flash_text = ""
 
         self.root = None
         self.tray_icon = None
@@ -226,6 +238,14 @@ class DesktopPanel:
     def _toggle_topmost_from_tray(self, _icon=None, _item=None):
         self._cmd_queue.put("toggle_top")
 
+    def _switch_virtual_from_tray(self, _icon=None, _item=None):
+        if self._on_switch_virtual:
+            self._on_switch_virtual()
+
+    def _restore_audio_from_tray(self, _icon=None, _item=None):
+        if self._on_restore_audio:
+            self._on_restore_audio()
+
     def _refresh_from_tray(self, _icon=None, _item=None):
         if self._on_refresh_iphone:
             self._on_refresh_iphone()
@@ -244,6 +264,9 @@ class DesktopPanel:
                 self._toggle_topmost_from_tray,
                 checked=lambda _item: self._always_on_top,
             ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("一键切回虚拟声卡", self._switch_virtual_from_tray),
+            pystray.MenuItem("暂时切回原声卡", self._restore_audio_from_tray),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("立即刷新手机电量", self._refresh_from_tray),
             pystray.MenuItem("打开 Windows 蓝牙设置", self._bt_settings_from_tray),
@@ -351,6 +374,23 @@ class DesktopPanel:
         )
         self.lbl_ap_model.pack(fill="x", pady=(0, s(4)))
 
+        self.btn_ap_menu = tk.Button(
+            ap_head,
+            text="换耳机 ▾",
+            command=self._show_airpods_menu,
+            bg=BG_BTN,
+            fg=FG_SECONDARY,
+            activebackground="#3a3a44",
+            activeforeground=FG_PRIMARY,
+            relief="flat",
+            bd=0,
+            padx=s(6),
+            pady=s(1),
+            cursor="hand2",
+            font=("Microsoft YaHei UI", 8),
+        )
+        self.btn_ap_menu.pack(side="right", padx=(s(6), 0))
+
         self.lbl_ap_badge = tk.Label(
             ap_head,
             text="扫描中...",
@@ -446,7 +486,109 @@ class DesktopPanel:
         )
         self.btn_ph_pair.pack(side="right")
 
-        # ---- Card 3: Audio Bridge Server Info ----
+        # ---- Card 3: Virtual Sound Card Auto-Switch ----
+        card_vsc = tk.Frame(outer, bg=BG_CARD, padx=s(12), pady=s(10))
+        card_vsc.pack(fill="x", pady=(0, s(10)))
+
+        vsc_head = tk.Frame(card_vsc, bg=BG_CARD)
+        vsc_head.pack(fill="x", pady=(0, s(4)))
+
+        tk.Label(
+            vsc_head,
+            text="🔊 虚拟声卡",
+            bg=BG_CARD,
+            fg=FG_PRIMARY,
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(side="left")
+
+        self.lbl_vsc_badge = tk.Label(
+            vsc_head,
+            text="检测中...",
+            bg=BG_CARD,
+            fg=FG_MUTED,
+            font=("Microsoft YaHei UI", 8),
+        )
+        self.lbl_vsc_badge.pack(side="right")
+
+        self.lbl_vsc_detail = tk.Label(
+            card_vsc,
+            text="正在检测系统音频设备...",
+            bg=BG_CARD,
+            fg=FG_SECONDARY,
+            font=("Microsoft YaHei UI", 8),
+            justify="left",
+            anchor="w",
+            wraplength=s(330),
+        )
+        self.lbl_vsc_detail.pack(fill="x", pady=(0, s(2)))
+
+        self.lbl_vsc_restore = tk.Label(
+            card_vsc,
+            text="退出恢复: --",
+            bg=BG_CARD,
+            fg=FG_MUTED,
+            font=("Microsoft YaHei UI", 8),
+            justify="left",
+            anchor="w",
+            wraplength=s(330),
+        )
+        self.lbl_vsc_restore.pack(fill="x", pady=(0, s(6)))
+
+        vsc_btn_row = tk.Frame(card_vsc, bg=BG_CARD)
+        vsc_btn_row.pack(fill="x")
+
+        self.btn_switch_virtual = tk.Button(
+            vsc_btn_row,
+            text="一键切回虚拟声卡",
+            command=self._handle_switch_virtual_click,
+            bg=BG_BTN_PRIMARY,
+            fg="#ffffff",
+            activebackground="#0070e0",
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=s(10),
+            pady=s(3),
+            cursor="hand2",
+            font=("Microsoft YaHei UI", 8, "bold"),
+        )
+        self.btn_switch_virtual.pack(side="left")
+
+        self.btn_restore_audio = tk.Button(
+            vsc_btn_row,
+            text="暂时切回原声卡",
+            command=self._handle_restore_audio_click,
+            bg=BG_BTN,
+            fg=FG_SECONDARY,
+            activebackground="#3a3a44",
+            activeforeground=FG_PRIMARY,
+            relief="flat",
+            bd=0,
+            padx=s(8),
+            pady=s(3),
+            cursor="hand2",
+            font=("Microsoft YaHei UI", 8),
+        )
+        self.btn_restore_audio.pack(side="left", padx=(s(6), 0))
+
+        self.btn_pick_virtual = tk.Button(
+            vsc_btn_row,
+            text="换卡 ▾",
+            command=self._show_virtual_picker_menu,
+            bg=BG_BTN,
+            fg=FG_SECONDARY,
+            activebackground="#3a3a44",
+            activeforeground=FG_PRIMARY,
+            relief="flat",
+            bd=0,
+            padx=s(8),
+            pady=s(3),
+            cursor="hand2",
+            font=("Microsoft YaHei UI", 8),
+        )
+        self.btn_pick_virtual.pack(side="right")
+
+        # ---- Card 4: Audio Bridge Server Info ----
         card_srv = tk.Frame(outer, bg=BG_CARD, padx=s(12), pady=s(10))
         card_srv.pack(fill="x", pady=(0, s(10)))
 
@@ -606,6 +748,130 @@ class DesktopPanel:
             1500, lambda: self.btn_copy.config(text="复制地址", fg=FG_PRIMARY)
         )
 
+    def _flash_switch_badge(self, text: str):
+        self._switch_flash_text = text
+        if self._switch_reset_after and self.root:
+            self.root.after_cancel(self._switch_reset_after)
+        if self.root:
+            self._switch_reset_after = self.root.after(
+                1400, lambda: setattr(self, "_switch_flash_text", "")
+            )
+
+    def _handle_switch_virtual_click(self):
+        if self._on_switch_virtual:
+            self._on_switch_virtual()
+        self._flash_switch_badge("✓ 已切回虚拟声卡")
+
+    def _handle_restore_audio_click(self):
+        if self._on_restore_audio:
+            self._on_restore_audio()
+        self._flash_switch_badge("✓ 已恢复原声卡")
+
+    def _show_virtual_picker_menu(self):
+        if not self.root or not self._on_switch_virtual:
+            return
+        state = self._get_state()
+        audio_sw = state.get("audioSwitch", {})
+        choices = audio_sw.get("virtualRenderChoices") or []
+        if not choices:
+            return
+
+        current_vid = audio_sw.get("virtualRenderId", "")
+        menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            bg=BG_CARD,
+            fg=FG_PRIMARY,
+            activebackground=BG_BTN_PRIMARY,
+            activeforeground="#ffffff",
+            font=("Microsoft YaHei UI", 8),
+            bd=1,
+            relief="solid",
+        )
+        for ch in choices:
+            cid = ch.get("id", "")
+            cname = ch.get("name", "")
+            tag = " (独立不串音)" if ch.get("tier") == 1 else ""
+            prefix = "✓ " if cid == current_vid else "    "
+            menu.add_command(
+                label=f"{prefix}{cname}{tag}",
+                command=lambda target_id=cid: self._select_virtual_render(target_id),
+            )
+
+        try:
+            bx = self.btn_pick_virtual.winfo_rootx()
+            by = self.btn_pick_virtual.winfo_rooty() + self.btn_pick_virtual.winfo_height()
+            menu.tk_popup(bx, by)
+        finally:
+            menu.grab_release()
+
+    def _select_virtual_render(self, render_id: str):
+        if self._on_switch_virtual:
+            self._on_switch_virtual(render_id)
+        self._flash_switch_badge("✓ 已切换虚拟声卡")
+
+    def _show_airpods_menu(self):
+        if not self.root:
+            return
+        state = self._get_state()
+        ap = state.get("battery", {}).get("airpods", {})
+        candidates = ap.get("candidates") or []
+        locked = bool(ap.get("locked"))
+        has_active = bool(ap.get("activeKey") or ap.get("updatedAt") or locked)
+
+        menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            bg=BG_CARD,
+            fg=FG_PRIMARY,
+            activebackground=BG_BTN_PRIMARY,
+            activeforeground="#ffffff",
+            font=("Microsoft YaHei UI", 8),
+            bd=1,
+            relief="solid",
+        )
+
+        if candidates:
+            for cand in candidates:
+                ckey = cand.get("key", "")
+                title = cand.get("name") or cand.get("model") or "AirPods"
+                if cand.get("isSingle"):
+                    s_pct = cand.get("single")
+                    bat_str = f"{s_pct}%" if s_pct is not None else "--%"
+                else:
+                    l_p = f"{cand['left']}%" if cand.get("left") is not None else "--"
+                    r_p = f"{cand['right']}%" if cand.get("right") is not None else "--"
+                    bat_str = f"L {l_p} R {r_p}"
+                rssi = cand.get("rssi")
+                rssi_str = f" ({rssi} dBm)" if rssi is not None else ""
+                ignored_tag = " [已屏蔽]" if cand.get("ignored") else ""
+                prefix = "✓ " if cand.get("isCurrent") else "    "
+                menu.add_command(
+                    label=f"{prefix}{title} · {bat_str}{rssi_str}{ignored_tag}",
+                    command=lambda k=ckey: self._on_select_airpods and self._on_select_airpods(k),
+                )
+        else:
+            menu.add_command(label="附近暂未收到耳机开盖广播", state="disabled")
+
+        menu.add_separator()
+        menu.add_command(
+            label="🚫 这不是我的耳机 (屏蔽当前并重搜)",
+            state="normal" if (has_active and self._on_reject_airpods) else "disabled",
+            command=lambda: self._on_reject_airpods and self._on_reject_airpods(),
+        )
+        menu.add_command(
+            label="🔓 解除耳机绑定 (允许识别新耳机)",
+            state="normal" if (locked and self._on_unlock_airpods) else "disabled",
+            command=lambda: self._on_unlock_airpods and self._on_unlock_airpods(),
+        )
+
+        try:
+            bx = self.btn_ap_menu.winfo_rootx()
+            by = self.btn_ap_menu.winfo_rooty() + self.btn_ap_menu.winfo_height()
+            menu.tk_popup(bx, by)
+        finally:
+            menu.grab_release()
+
     def _handle_refresh_click(self):
         if self._on_refresh_iphone:
             self._on_refresh_iphone()
@@ -720,12 +986,14 @@ class DesktopPanel:
 
             # 1. Update AirPods card
             ap_online = ap.get("online", False)
+            ap_locked = ap.get("locked", False)
             ap_model = ap.get("model") or "耳机电量 (AirPods / Beats)"
             ap_name = ap.get("name") or ap_model
             self.lbl_ap_title.config(text=f"🎧 {ap_name}")
             self.lbl_ap_model.config(
                 text=f"型号: {ap_model}" if ap_name != ap_model else ""
             )
+            self.btn_ap_menu.config(text="🔒 换耳机 ▾" if ap_locked else "换耳机 ▾")
 
             if ap_online:
                 wearing = ap.get("leftInEar") or ap.get("rightInEar")
@@ -733,8 +1001,10 @@ class DesktopPanel:
                 self.lbl_ap_badge.config(text=badge_txt, fg=FG_GREEN)
             elif ap.get("updatedAt"):
                 self.lbl_ap_badge.config(text="休眠 / 已入盒", fg=FG_MUTED)
+            elif ap_locked:
+                self.lbl_ap_badge.config(text="已锁定 · 等待开盖", fg=FG_MUTED)
             else:
-                self.lbl_ap_badge.config(text="开盖或佩戴后自动显示", fg=FG_MUTED)
+                self.lbl_ap_badge.config(text="开盖自动绑定", fg=FG_MUTED)
 
             if ap.get("isSingle"):
                 val_txt, col = self._format_pod_value(
@@ -817,9 +1087,68 @@ class DesktopPanel:
                 if not self.btn_ph_pair.winfo_ismapped():
                     self.btn_ph_pair.pack(side="right")
 
-            self._fit_window_height(initial=False)
+            # 3. Update Virtual Sound Card card
+            audio_sw = state.get("audioSwitch", {})
+            v_avail = audio_sw.get("virtualAvailable", False)
+            on_virt = audio_sw.get("isOnVirtual", False)
+            choices = audio_sw.get("virtualRenderChoices") or []
 
-            # 3. Update Server Info card
+            if self._switch_flash_text:
+                self.lbl_vsc_badge.config(text=self._switch_flash_text, fg=FG_GREEN)
+            elif not v_avail:
+                self.lbl_vsc_badge.config(text="未检测到虚拟声卡", fg=FG_MUTED)
+            elif on_virt:
+                self.lbl_vsc_badge.config(text="● 虚拟声卡生效中", fg=FG_GREEN)
+            else:
+                self.lbl_vsc_badge.config(text="● 已手动切离 (可一键切回)", fg=FG_YELLOW)
+
+            if not v_avail:
+                self.lbl_vsc_detail.config(
+                    text="未发现虚拟扬声器或 VB-Cable，请先安装虚拟声卡驱动",
+                    fg=FG_MUTED,
+                )
+                self.btn_switch_virtual.config(state="disabled", bg=BG_BTN, fg=FG_MUTED)
+                self.btn_restore_audio.config(state="disabled")
+            else:
+                self.btn_switch_virtual.config(state="normal")
+                self.btn_restore_audio.config(state="normal")
+                if on_virt:
+                    v_r = audio_sw.get("virtualRenderName") or "未接管"
+                    v_c = audio_sw.get("virtualCaptureName") or "未接管"
+                    self.lbl_vsc_detail.config(
+                        text=f"接管目标: {v_r}  ·  {v_c}",
+                        fg=FG_SECONDARY,
+                    )
+                    self.btn_switch_virtual.config(
+                        bg=BG_BTN,
+                        fg=FG_PRIMARY,
+                        activebackground="#3a3a44",
+                    )
+                else:
+                    cur_r = audio_sw.get("currentRenderName") or "--"
+                    cur_c = audio_sw.get("currentCaptureName") or "--"
+                    self.lbl_vsc_detail.config(
+                        text=f"当前系统: {cur_r}  ·  {cur_c}",
+                        fg=FG_YELLOW,
+                    )
+                    self.btn_switch_virtual.config(
+                        bg=BG_BTN_PRIMARY,
+                        fg="#ffffff",
+                        activebackground="#0070e0",
+                    )
+
+            orig_r = audio_sw.get("originalRenderName") or "--"
+            orig_c = audio_sw.get("originalCaptureName") or "--"
+            self.lbl_vsc_restore.config(text=f"退出自动切回: {orig_r}  ·  {orig_c}")
+
+            if len(choices) > 1:
+                if not self.btn_pick_virtual.winfo_ismapped():
+                    self.btn_pick_virtual.pack(side="right")
+            else:
+                if self.btn_pick_virtual.winfo_ismapped():
+                    self.btn_pick_virtual.pack_forget()
+
+            # 4. Update Server Info card
             self.lbl_url.config(text=state.get("url", "https://127.0.0.1:8443"))
             dev_name = state.get("deviceName") or "未检测到声卡"
             rate = state.get("sampleRate") or "--"
@@ -871,7 +1200,9 @@ class DesktopPanel:
                 fg=FG_GREEN if clients_cnt > 0 else FG_SECONDARY,
             )
 
-            # 4. Update System Tray Tooltip & Icon
+            self._fit_window_height(initial=False)
+
+            # 5. Update System Tray Tooltip & Icon
             ap_tip = "未检测"
             if ap.get("isSingle") and ap.get("single") is not None:
                 ap_tip = f"{ap['single']}%"

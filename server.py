@@ -18,6 +18,7 @@ from pathlib import Path
 import pyaudiowpatch as pyaudio
 from aiohttp import web
 
+from audio_switcher import AudioDeviceSwitcher
 from battery_monitor import BatteryMonitor
 
 
@@ -26,7 +27,7 @@ PORT = 8443  # HTTPS is required for microphone access on iOS
 
 CHANNELS = 2
 CHUNK = 960
-DEVICE_POLL_INTERVAL = 2.0
+DEVICE_POLL_INTERVAL = 1.2
 
 BASE_DIR = Path(__file__).parent
 WEB_DIR = BASE_DIR / "web"
@@ -43,6 +44,7 @@ async_stop_event = None
 pa = None
 audio_stream = None
 mic_stream = None
+active_render_id = None
 stream_lock = threading.Lock()
 shutdown_event = threading.Event()
 
@@ -55,7 +57,35 @@ server_url = f"https://127.0.0.1:{PORT}"
 mic_queue = queue.Queue(maxsize=10)
 mic_info = {"available": False, "rate": 48000, "channels": 2, "deviceName": ""}
 
-battery_monitor = BatteryMonitor()
+battery_monitor = BatteryMonitor(state_file=BASE_DIR / ".airpods_binding.json")
+audio_switcher = AudioDeviceSwitcher(BASE_DIR / ".audio_switcher_state.json")
+_console_ctrl_handler_ref = None
+
+
+def _install_console_exit_handler():
+    global _console_ctrl_handler_ref
+    if sys.platform != "win32" or _console_ctrl_handler_ref is not None:
+        return
+    try:
+        handler_type = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, DWORD)
+
+        def _handler(ctrl_type):
+            # 2=CTRL_CLOSE_EVENT, 5=CTRL_LOGOFF_EVENT, 6=CTRL_SHUTDOWN_EVENT
+            if ctrl_type in (2, 5, 6):
+                try:
+                    shutdown_audio_devices()
+                except Exception:
+                    pass
+                try:
+                    audio_switcher.restore_on_exit()
+                except Exception:
+                    pass
+            return False
+
+        _console_ctrl_handler_ref = handler_type(_handler)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_ctrl_handler_ref, True)
+    except Exception:
+        pass
 
 
 def _validated_sample_rate(value):
@@ -286,11 +316,9 @@ def find_loopback_device(pa_instance, verbose=True):
     # Primary: query WASAPI's native default output loopback directly
     try:
         default_loopback = pa_instance.get_default_wasapi_loopback()
-        if not _is_virtual_cable(default_loopback["name"]):
-            return default_loopback
-
-        print("! Warning: Windows default output is set to VB-Cable.")
-        print("  Selecting a physical speaker loopback instead to avoid mic feedback.")
+        if _is_virtual_cable(default_loopback["name"]) and verbose:
+            print("! Note: Windows default output is VB-Cable; capturing its loopback.")
+        return default_loopback
     except (OSError, LookupError):
         pass
 
@@ -386,11 +414,12 @@ def _close_streams_unlocked():
 
 def setup_audio_devices(verbose=True):
     """Initialize or re-initialize WASAPI loopback capture and VB-Cable mic output."""
-    global pa, audio_stream, mic_stream, stream_rate, stream_channels, stream_device_name
+    global pa, audio_stream, mic_stream, active_render_id, stream_rate, stream_channels, stream_device_name
 
     with stream_lock:
         _close_streams_unlocked()
 
+        active_render_id = get_windows_default_render_id()
         pa = pyaudio.PyAudio()
 
         # 1. System audio loopback capture
@@ -458,6 +487,8 @@ def shutdown_audio_devices():
         _close_streams_unlocked()
 
 
+# atexit runs in LIFO order: shutdown_audio_devices runs first, then restore_on_exit
+atexit.register(audio_switcher.restore_on_exit)
 atexit.register(shutdown_audio_devices)
 
 
@@ -498,24 +529,63 @@ async def notify_clients_config():
             clients.discard(client)
 
 
+def _sync_loopback_after_endpoint_switch():
+    """Immediately re-bind WASAPI loopback if Windows default playback device changed."""
+    if shutdown_event.is_set():
+        return
+    current_id = get_windows_default_render_id()
+    if not current_id or current_id == active_render_id:
+        return
+    try:
+        setup_audio_devices(verbose=False)
+        if loop is not None:
+            asyncio.run_coroutine_threadsafe(notify_clients_config(), loop)
+    except Exception as e:
+        print("Failed to refresh loopback after audio switch:", e)
+
+
+def trigger_switch_to_virtual(preferred_render_id=None):
+    def _worker():
+        audio_switcher.switch_to_virtual(preferred_render_id=preferred_render_id)
+        _sync_loopback_after_endpoint_switch()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def trigger_restore_previous_audio():
+    def _worker():
+        audio_switcher.restore_previous(mark_session_ended=False)
+        _sync_loopback_after_endpoint_switch()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 async def device_monitor_loop():
-    """Watch Windows default playback device and hot-switch WASAPI loopback automatically."""
-    last_id = await asyncio.to_thread(get_windows_default_render_id)
+    """Watch Windows default playback & recording devices, hot-switching loopback and UI state."""
+    _, last_capture_id = await asyncio.to_thread(audio_switcher.get_current_default_ids)
 
     while not shutdown_event.is_set():
         await asyncio.sleep(DEVICE_POLL_INTERVAL)
 
-        current_id = await asyncio.to_thread(get_windows_default_render_id)
-        if not current_id or current_id == last_id:
+        current_render_id, current_capture_id = await asyncio.to_thread(
+            audio_switcher.get_current_default_ids
+        )
+        render_changed = bool(current_render_id and current_render_id != active_render_id)
+        capture_changed = current_capture_id != last_capture_id
+
+        if not render_changed and not capture_changed:
             continue
 
-        last_id = current_id
-        print("\n[~] Windows default playback device changed, switching loopback...")
-        try:
-            await asyncio.to_thread(setup_audio_devices, False)
-            await notify_clients_config()
-        except Exception as e:
-            print("Failed to switch playback device:", e)
+        last_capture_id = current_capture_id
+        if render_changed:
+            print("\n[~] Windows default playback device changed, switching loopback...")
+            try:
+                await asyncio.to_thread(setup_audio_devices, False)
+                await notify_clients_config()
+            except Exception as e:
+                print("Failed to switch playback device:", e)
+
+        await asyncio.to_thread(audio_switcher.refresh_status)
 
 
 async def websocket_handler(request):
@@ -711,6 +781,7 @@ def get_desktop_state():
         "micActive": active_mic_ws is not None and not active_mic_ws.closed,
         "micAvailable": mic_info["available"],
         "battery": battery_monitor.get_snapshot(),
+        "audioSwitch": audio_switcher.get_cached_status(),
     }
 
 
@@ -733,8 +804,14 @@ async def main():
     broadcast_task = None
     monitor_task = None
 
+    _install_console_exit_handler()
+
     try:
         battery_monitor.start_background()
+        if "--no-auto-switch" in sys.argv:
+            await asyncio.to_thread(audio_switcher.refresh_status)
+        else:
+            await asyncio.to_thread(audio_switcher.switch_on_startup)
         setup_audio_devices(verbose=True)
         threading.Thread(target=mic_writer, daemon=True).start()
 
@@ -790,6 +867,7 @@ async def main():
         if runner is not None:
             await runner.cleanup()
         shutdown_audio_devices()
+        await asyncio.to_thread(audio_switcher.restore_on_exit)
 
 
 def run_with_gui():
@@ -812,6 +890,7 @@ def run_with_gui():
     def on_quit():
         request_server_stop()
         server_thread.join(timeout=2.5)
+        audio_switcher.restore_on_exit()
 
     def on_restart():
         def restart_worker():
@@ -821,6 +900,8 @@ def run_with_gui():
                 print("Restart aborted: server did not stop in time.")
                 panel.request_restart_failed()
                 return
+
+            audio_switcher.restore_on_exit()
 
             try:
                 subprocess.Popen(
@@ -842,10 +923,17 @@ def run_with_gui():
         on_quit_fn=on_quit,
         on_pair_iphone_fn=battery_monitor.trigger_ble_pair,
         on_restart_fn=on_restart,
+        on_switch_virtual_fn=trigger_switch_to_virtual,
+        on_restore_audio_fn=trigger_restore_previous_audio,
+        on_select_airpods_fn=battery_monitor.select_airpods_candidate,
+        on_reject_airpods_fn=battery_monitor.reject_current_airpods,
+        on_unlock_airpods_fn=battery_monitor.unlock_airpods_binding,
     )
     panel_ref["panel"] = panel
 
     signal.signal(signal.SIGINT, lambda *_: panel.request_quit())
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, lambda *_: panel.request_quit())
     panel.run()
 
 
@@ -855,11 +943,15 @@ if __name__ == "__main__":
             asyncio.run(main())
         except KeyboardInterrupt:
             print("\nShutting down...")
+        finally:
+            audio_switcher.restore_on_exit()
     else:
         try:
             run_with_gui()
         except KeyboardInterrupt:
             print("\nShutting down...")
             request_server_stop()
+        finally:
+            audio_switcher.restore_on_exit()
 
 
