@@ -8,6 +8,7 @@ from desktop_ui import (
     DesktopPanel,
     _nightcord_clock_str,
     create_tray_icon_image,
+    evaluate_edge_suppression,
     render_nightcord_emblem,
 )
 from server import _validated_sample_rate
@@ -157,6 +158,59 @@ class DesktopStatusTests(unittest.TestCase):
         tray = create_tray_icon_image(connected=True, low_battery=False)
         self.assertEqual(tray.size, (64, 64))
         self.assertEqual(tray.mode, "RGBA")
+
+    def test_game_and_camera_lock_suppresses_right_edge_drawer(self):
+        # Normal maximized desktop window (e.g. JetBrains IDE / Chrome) -> allowed
+        base_desktop = {
+            "cursor_info_ok": True,
+            "cursor_flags": 1,
+            "mouse_button_down": False,
+            "clip_rect": (0, 0, 2048, 1152),
+            "virtual_screen": (0, 0, 2048, 1152),
+            "qstate": 5,
+            "fg_is_self": False,
+            "fg_class": "SunAwtFrame",
+            "fg_rect": (-7, -7, 2055, 1111),
+            "fg_monitor_rect": (0, 0, 2048, 1152),
+            "fg_style": 0x17CF0000,
+        }
+        self.assertEqual(evaluate_edge_suppression(base_desktop), (False, ""))
+
+        # Bare Windows Desktop (WorkerW covering full monitor) -> allowed
+        bare_desktop = {
+            **base_desktop,
+            "fg_class": "WorkerW",
+            "fg_rect": (0, 0, 2048, 1152),
+            "fg_style": 0x16000000,
+        }
+        self.assertEqual(evaluate_edge_suppression(bare_desktop), (False, ""))
+
+        # 3D camera-rotation game hiding cursor (even in small windowed mode) -> suppressed
+        fps_camera = {**base_desktop, "cursor_flags": 0}
+        self.assertEqual(evaluate_edge_suppression(fps_camera), (True, "cursor_hidden"))
+
+        # Right-click / Left-click camera drag in windowed RPG -> suppressed
+        rpg_drag = {**base_desktop, "mouse_button_down": True}
+        self.assertEqual(evaluate_edge_suppression(rpg_drag), (True, "mouse_button_down"))
+
+        # Windowed game trapping mouse via ClipCursor -> suppressed
+        clipped_game = {**base_desktop, "clip_rect": (200, 120, 1800, 1020)}
+        self.assertEqual(evaluate_edge_suppression(clipped_game), (True, "cursor_clipped"))
+
+        # Borderless-fullscreen game (WS_POPUP covering full monitor, cursor visible) -> suppressed
+        borderless_game = {
+            **base_desktop,
+            "fg_class": "UnityWndClass",
+            "fg_rect": (0, 0, 2048, 1152),
+            "fg_style": 0x96000000,
+        }
+        self.assertEqual(
+            evaluate_edge_suppression(borderless_game), (True, "fullscreen_window")
+        )
+
+        # Exclusive D3D fullscreen -> suppressed
+        d3d_game = {**base_desktop, "qstate": 3}
+        self.assertEqual(evaluate_edge_suppression(d3d_game), (True, "d3d_fullscreen"))
 
 
 if __name__ == "__main__":

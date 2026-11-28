@@ -1,6 +1,7 @@
 from ctypes import wintypes
 import ctypes
 import datetime
+import json
 import os
 from pathlib import Path
 import queue
@@ -77,6 +78,203 @@ class _MONITORINFO(ctypes.Structure):
     ]
 
 
+class _CURSORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hCursor", ctypes.c_void_p),
+        ("ptScreenPos", _POINT),
+    ]
+
+
+_DESKTOP_SHELL_CLASSES = {
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "NotifyIconOverflowWindow",
+}
+_CURSOR_SHOWING = 0x00000001
+_CURSOR_SUPPRESSED = 0x00000002
+_WS_MAXIMIZE = 0x01000000
+_WS_CAPTION = 0x00C00000
+_UI_PREFS_FILE = BASE_DIR / ".ui_prefs.json"
+
+
+def _load_ui_prefs() -> dict:
+    try:
+        if _UI_PREFS_FILE.exists():
+            data = json.loads(_UI_PREFS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_ui_prefs(prefs: dict):
+    try:
+        _UI_PREFS_FILE.write_text(
+            json.dumps(prefs, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def evaluate_edge_suppression(snap: dict) -> tuple[bool, str]:
+    """
+    Pure decision logic determining whether right-edge hover must be suppressed
+    due to gaming / 3D camera rotation / cursor capture / fullscreen apps.
+    Returns (should_suppress, reason).
+    """
+    # 1. Hidden or OS-suppressed cursor (catches 100% of FPS/TPS/Action/3D camera-lock
+    #    games in fullscreen, borderless, OR windowed mode, plus custom-cursor games).
+    if snap.get("cursor_info_ok"):
+        flags = int(snap.get("cursor_flags", _CURSOR_SHOWING))
+        if (flags & _CURSOR_SHOWING) == 0 or (flags & _CURSOR_SUPPRESSED) != 0:
+            return True, "cursor_hidden"
+
+    # 2. Any mouse button held down (right-click / left-click camera drag in RPGs/MMOs,
+    #    window dragging, text selection, or scrollbar dragging).
+    if snap.get("mouse_button_down"):
+        return True, "mouse_button_down"
+
+    # 3. Cursor confined via Win32 ClipCursor() to a sub-region of the virtual desktop
+    #    (windowed games trapping the cursor inside their client area).
+    clip = snap.get("clip_rect")
+    vscreen = snap.get("virtual_screen")
+    if clip and vscreen and len(clip) == 4 and len(vscreen) == 4:
+        if (
+            clip[0] > vscreen[0] + 2
+            or clip[1] > vscreen[1] + 2
+            or clip[2] < vscreen[2] - 2
+            or clip[3] < vscreen[3] - 2
+        ):
+            return True, "cursor_clipped"
+
+    # 4. Exclusive Direct3D fullscreen or presentation mode
+    #    (QUNS_RUNNING_D3D_FULL_SCREEN = 3, QUNS_PRESENTATION_MODE = 4).
+    if int(snap.get("qstate", 0)) in (3, 4):
+        return True, "d3d_fullscreen"
+
+    # 5. Borderless-fullscreen games / fullscreen video (F11) covering the entire monitor.
+    #    Desktop shell windows and standard framed maximized windows are NOT blocked.
+    fg_class = str(snap.get("fg_class") or "")
+    if (
+        not snap.get("fg_is_self")
+        and fg_class
+        and fg_class not in _DESKTOP_SHELL_CLASSES
+    ):
+        fg_rect = snap.get("fg_rect")
+        mon_rect = snap.get("fg_monitor_rect")
+        if fg_rect and mon_rect and len(fg_rect) == 4 and len(mon_rect) == 4:
+            covers_full_monitor = (
+                fg_rect[0] <= mon_rect[0]
+                and fg_rect[1] <= mon_rect[1]
+                and fg_rect[2] >= mon_rect[2]
+                and fg_rect[3] >= mon_rect[3]
+            )
+            if covers_full_monitor:
+                fg_style = int(snap.get("fg_style", 0))
+                is_framed_maximized = bool(fg_style & _WS_MAXIMIZE) and bool(
+                    fg_style & _WS_CAPTION
+                )
+                if not is_framed_maximized:
+                    return True, "fullscreen_window"
+
+    return False, ""
+
+
+def _query_win32_interaction_snapshot(own_pid: int = 0) -> dict:
+    """Gather lightweight Win32 cursor, button, clip, and foreground window state."""
+    if sys.platform != "win32":
+        return {}
+
+    user32 = ctypes.windll.user32
+    snap = {}
+
+    try:
+        ci = _CURSORINFO(cbSize=ctypes.sizeof(_CURSORINFO))
+        if user32.GetCursorInfo(ctypes.byref(ci)):
+            snap["cursor_info_ok"] = True
+            snap["cursor_flags"] = int(ci.flags)
+        else:
+            snap["cursor_info_ok"] = False
+    except Exception:
+        snap["cursor_info_ok"] = False
+
+    try:
+        btn_down = any(
+            bool(user32.GetAsyncKeyState(vk) & 0x8000)
+            for vk in (0x01, 0x02, 0x04, 0x05, 0x06)
+        )
+        snap["mouse_button_down"] = btn_down
+    except Exception:
+        snap["mouse_button_down"] = False
+
+    try:
+        clip = _RECT()
+        if user32.GetClipCursor(ctypes.byref(clip)):
+            vx = int(user32.GetSystemMetrics(76))
+            vy = int(user32.GetSystemMetrics(77))
+            vw = int(user32.GetSystemMetrics(78))
+            vh = int(user32.GetSystemMetrics(79))
+            if vw > 0 and vh > 0:
+                snap["clip_rect"] = (
+                    int(clip.left),
+                    int(clip.top),
+                    int(clip.right),
+                    int(clip.bottom),
+                )
+                snap["virtual_screen"] = (vx, vy, vx + vw, vy + vh)
+    except Exception:
+        pass
+
+    try:
+        qstate = ctypes.c_int(0)
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(qstate)) == 0:
+            snap["qstate"] = int(qstate.value)
+    except Exception:
+        pass
+
+    try:
+        fg = user32.GetForegroundWindow()
+        if fg:
+            fg_pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+            snap["fg_is_self"] = bool(own_pid and int(fg_pid.value) == own_pid)
+            if not snap["fg_is_self"]:
+                cls_buf = ctypes.create_unicode_buffer(96)
+                user32.GetClassNameW(fg, cls_buf, 96)
+                snap["fg_class"] = cls_buf.value
+
+                fg_rc = _RECT()
+                if user32.GetWindowRect(fg, ctypes.byref(fg_rc)):
+                    snap["fg_rect"] = (
+                        int(fg_rc.left),
+                        int(fg_rc.top),
+                        int(fg_rc.right),
+                        int(fg_rc.bottom),
+                    )
+                snap["fg_style"] = int(user32.GetWindowLongW(fg, -16)) & 0xFFFFFFFF
+
+                hmon = user32.MonitorFromWindow(fg, 2)  # MONITOR_DEFAULTTONEAREST
+                if hmon:
+                    mi = _MONITORINFO(cbSize=ctypes.sizeof(_MONITORINFO))
+                    if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                        mr = mi.rcMonitor
+                        snap["fg_monitor_rect"] = (
+                            int(mr.left),
+                            int(mr.top),
+                            int(mr.right),
+                            int(mr.bottom),
+                        )
+    except Exception:
+        pass
+
+    return snap
+
+
 def _enable_high_dpi():
     if sys.platform != "win32":
         return
@@ -102,6 +300,59 @@ def _get_top_hwnd(window: tk.Tk) -> int:
         return int(hwnd)
     except Exception:
         return 0
+
+
+def _deiconify_drawer_window(window: tk.Tk, activate: bool = False):
+    """
+    Show the borderless drawer without stealing keyboard/mouse focus from the
+    currently active game or application when triggered via edge hover.
+    """
+    if sys.platform != "win32" or activate:
+        window.deiconify()
+        _configure_borderless_toolwindow(window)
+        window.lift()
+        window.attributes("-topmost", True)
+        return
+
+    hwnd = _get_top_hwnd(window)
+    user32 = ctypes.windll.user32
+    gwlp_exstyle = -20
+    ws_ex_noactivate = 0x08000000
+    ws_ex_toolwindow = 0x00000080
+    ws_ex_appwindow = 0x00040000
+
+    if not hwnd:
+        window.deiconify()
+        _configure_borderless_toolwindow(window)
+        return
+
+    if ctypes.sizeof(ctypes.c_void_p) == 8:
+        get_long = user32.GetWindowLongPtrW
+        set_long = user32.SetWindowLongPtrW
+        get_long.restype = ctypes.c_ssize_t
+        set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+    else:
+        get_long = user32.GetWindowLongW
+        set_long = user32.SetWindowLongW
+
+    prev_fg = user32.GetForegroundWindow()
+    orig_style = get_long(hwnd, gwlp_exstyle)
+    temp_style = (orig_style | ws_ex_toolwindow | ws_ex_noactivate) & ~ws_ex_appwindow
+    set_long(hwnd, gwlp_exstyle, temp_style)
+
+    window.deiconify()
+    _configure_borderless_toolwindow(window)
+
+    # Clear WS_EX_NOACTIVATE after mapping so clicking buttons inside the drawer still works,
+    # while keeping focus on the user's previous foreground window.
+    clean_style = (get_long(hwnd, gwlp_exstyle) | ws_ex_toolwindow) & ~(
+        ws_ex_appwindow | ws_ex_noactivate
+    )
+    set_long(hwnd, gwlp_exstyle, clean_style)
+    # HWND_TOPMOST = -1, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW = 0x0053
+    user32.SetWindowPos(wintypes.HWND(hwnd), wintypes.HWND(-1), 0, 0, 0, 0, 0x0053)
+    if prev_fg and prev_fg != hwnd and user32.GetForegroundWindow() == hwnd:
+        user32.SetForegroundWindow(prev_fg)
 
 
 def _configure_borderless_toolwindow(window: tk.Tk):
@@ -480,10 +731,13 @@ class DesktopPanel:
         self._on_unlock_airpods = on_unlock_airpods_fn
         self._on_toggle_autostart = on_toggle_autostart_fn
 
+        prefs = _load_ui_prefs()
         self._cmd_queue = queue.Queue()
         self._pinned = False
+        self._edge_hover_enabled = bool(prefs.get("edgeHoverEnabled", True))
         self._autostart_enabled = False
         self._quitting = False
+        self._own_pid = os.getpid()
         self._last_tooltip = ""
         self._last_icon_state = None
         self._copy_reset_after = None
@@ -498,6 +752,8 @@ class DesktopPanel:
         self._outside_since = None
         self._manual_grace_until = 0.0
         self._suppress_edge_until = 0.0
+        self._require_edge_reentry = False
+        self._last_cursor_y = None
         self._dock_x = 0
         self._dock_y = 0
         self._mon_right = 1920
@@ -529,6 +785,9 @@ class DesktopPanel:
     def _toggle_pin_from_tray(self, _icon=None, _item=None):
         self._cmd_queue.put("toggle_pin")
 
+    def _toggle_edge_hover_from_tray(self, _icon=None, _item=None):
+        self._cmd_queue.put("toggle_edge_hover")
+
     def _toggle_autostart_from_tray(self, _icon=None, _item=None):
         self._cmd_queue.put("toggle_autostart")
 
@@ -554,6 +813,11 @@ class DesktopPanel:
         menu = pystray.Menu(
             pystray.MenuItem(
                 "呼出 / 收起侧栏", self._toggle_window_from_tray, default=True
+            ),
+            pystray.MenuItem(
+                "贴边自动呼出 (智能防游戏误触)",
+                self._toggle_edge_hover_from_tray,
+                checked=lambda _item: self._edge_hover_enabled,
             ),
             pystray.MenuItem(
                 "固定面板常驻 (不自动收起)",
@@ -1157,11 +1421,19 @@ class DesktopPanel:
         footer = tk.Frame(outer, bg=BG_MAIN)
         footer.pack(fill="x")
 
-        self.lbl_footer_hint = tk.Label(
+        self.lbl_footer_hint = tk.Button(
             footer,
-            text="贴右缘呼出 · 移开收起",
+            text="",
+            command=self._toggle_edge_hover,
             bg=BG_MAIN,
             fg=FG_MUTED,
+            activebackground=BG_BTN,
+            activeforeground=FG_PRIMARY,
+            relief="flat",
+            bd=0,
+            padx=s(4),
+            pady=s(2),
+            cursor="hand2",
             font=("Microsoft YaHei UI", 8),
         )
         self.lbl_footer_hint.pack(side="left")
@@ -1216,6 +1488,7 @@ class DesktopPanel:
         )
         self.btn_autostart.pack(side="right", padx=(0, s(5)))
 
+        self._refresh_footer_hint()
         self._fit_window_height(initial=True)
         _configure_borderless_toolwindow(root)
 
@@ -1232,8 +1505,9 @@ class DesktopPanel:
         if manual:
             self._manual_grace_until = time.monotonic() + 3.0
         if self._drawer_visible and not self._animating:
-            self.root.lift()
-            self.root.attributes("-topmost", True)
+            if manual:
+                self.root.lift()
+                self.root.attributes("-topmost", True)
             return
 
         tx, ty, mr = self._compute_dock_position(ref_x, ref_y)
@@ -1245,10 +1519,7 @@ class DesktopPanel:
         h = max(int(430 * self._dpi), self._last_height)
         start_x = mr - int(round(12 * self._dpi))
         self.root.geometry(f"{self._win_width}x{h}+{start_x}+{ty}")
-        self.root.deiconify()
-        _configure_borderless_toolwindow(self.root)
-        self.root.lift()
-        self.root.attributes("-topmost", True)
+        _deiconify_drawer_window(self.root, activate=manual)
 
         steps = 9
 
@@ -1273,7 +1544,6 @@ class DesktopPanel:
             return
         if force_unpin and self._pinned:
             self._set_pinned(False)
-            # Suppress immediate re-trigger for 0.6s when manually dismissed
             self._suppress_edge_until = time.monotonic() + 0.6
         elif force_unpin:
             self._suppress_edge_until = time.monotonic() + 0.6
@@ -1314,29 +1584,59 @@ class DesktopPanel:
         try:
             now = time.monotonic()
             cx, cy = _get_cursor_pos(self.root)
+            dy = abs(cy - self._last_cursor_y) if self._last_cursor_y is not None else 0
+            self._last_cursor_y = cy
+
+            snap = _query_win32_interaction_snapshot(self._own_pid)
+            suppressed, reason = evaluate_edge_suppression(snap)
+            if suppressed:
+                self._edge_dwell_since = None
+                self._suppress_edge_until = max(self._suppress_edge_until, now + 0.85)
+                self._require_edge_reentry = True
+                # If user entered 3D camera-lock or D3D fullscreen while drawer was unpinned, hide immediately
+                if (
+                    self._drawer_visible
+                    and not self._pinned
+                    and not self._popup_menu_open
+                    and reason in ("cursor_hidden", "d3d_fullscreen")
+                ):
+                    self._slide_out_drawer()
 
             if not self._drawer_visible:
-                if now >= self._suppress_edge_until:
+                if self._edge_hover_enabled and not suppressed:
                     _ml, _mt, mr, _mb, wt, wb, is_outer = _get_monitor_geometry_at(
                         cx, cy, self.root
                     )
-                    edge_tol = max(4, int(round(4 * self._dpi)))
-                    # Leave top 48px (maximized app X close button) & bottom 40px (taskbar clock) untouched
-                    safe_top = wt + int(round(48 * self._dpi))
-                    safe_bot = wb - int(round(40 * self._dpi))
-                    at_right_edge = (
-                        is_outer
-                        and cx >= (mr - edge_tol)
-                        and safe_top <= cy <= safe_bot
-                    )
-                    if at_right_edge:
-                        if self._edge_dwell_since is None:
-                            self._edge_dwell_since = now
-                        elif (now - self._edge_dwell_since) >= 0.075:
+                    reentry_margin = max(28, int(round(28 * self._dpi)))
+                    if self._require_edge_reentry:
+                        if cx < (mr - reentry_margin):
+                            self._require_edge_reentry = False
+                        else:
                             self._edge_dwell_since = None
-                            self._slide_in_drawer(cx, cy, manual=False)
-                    else:
-                        self._edge_dwell_since = None
+
+                    if not self._require_edge_reentry and now >= self._suppress_edge_until:
+                        edge_tol = max(2, int(round(2 * self._dpi)))
+                        # Leave top 48px (maximized app X close button) & bottom 40px (taskbar clock) untouched
+                        safe_top = wt + int(round(48 * self._dpi))
+                        safe_bot = wb - int(round(40 * self._dpi))
+                        at_right_edge = (
+                            is_outer
+                            and cx >= (mr - edge_tol)
+                            and safe_top <= cy <= safe_bot
+                        )
+                        if at_right_edge:
+                            # Reset dwell if cursor is swiping rapidly along the right scrollbar/edge
+                            if dy > int(round(26 * self._dpi)):
+                                self._edge_dwell_since = now
+                            elif self._edge_dwell_since is None:
+                                self._edge_dwell_since = now
+                            elif (now - self._edge_dwell_since) >= 0.22:
+                                self._edge_dwell_since = None
+                                self._slide_in_drawer(cx, cy, manual=False)
+                        else:
+                            self._edge_dwell_since = None
+                else:
+                    self._edge_dwell_since = None
             else:
                 if (
                     not self._pinned
@@ -1363,6 +1663,29 @@ class DesktopPanel:
             if not self._quitting and self.root:
                 self.root.after(40, self._poll_edge_hover)
 
+    def _refresh_footer_hint(self):
+        if not hasattr(self, "lbl_footer_hint") or self.lbl_footer_hint is None:
+            return
+        if self._pinned:
+            self.lbl_footer_hint.config(text="◈ 已常驻 (点击切换贴边)", fg=FG_SECONDARY)
+        elif self._edge_hover_enabled:
+            self.lbl_footer_hint.config(text="✓ 贴边呼出 · 游戏防误触", fg=FG_GREEN)
+        else:
+            self.lbl_footer_hint.config(text="○ 仅托盘呼出 (已关贴边)", fg=FG_YELLOW)
+
+    def _toggle_edge_hover(self):
+        self._edge_hover_enabled = not self._edge_hover_enabled
+        self._edge_dwell_since = None
+        prefs = _load_ui_prefs()
+        prefs["edgeHoverEnabled"] = self._edge_hover_enabled
+        _save_ui_prefs(prefs)
+        self._refresh_footer_hint()
+        if self.tray_icon:
+            try:
+                self.tray_icon.update_menu()
+            except Exception:
+                pass
+
     def _set_pinned(self, pinned: bool):
         self._pinned = bool(pinned)
         if self._pinned:
@@ -1371,14 +1694,13 @@ class DesktopPanel:
                 fg="#ffffff",
                 text="◈ 已常驻",
             )
-            self.lbl_footer_hint.config(text="已固定面板常驻")
         else:
             self.btn_pin.config(
                 bg=BG_BTN,
                 fg=FG_SECONDARY,
                 text="◈ 自动收起",
             )
-            self.lbl_footer_hint.config(text="贴右缘呼出 · 移开收起")
+        self._refresh_footer_hint()
         if self.tray_icon:
             try:
                 self.tray_icon.update_menu()
@@ -1620,6 +1942,8 @@ class DesktopPanel:
                 self._slide_in_drawer(manual=True)
             elif cmd == "toggle_pin":
                 self._toggle_pin()
+            elif cmd == "toggle_edge_hover":
+                self._toggle_edge_hover()
             elif cmd == "toggle_autostart":
                 self._handle_toggle_autostart()
             elif cmd == "quit":

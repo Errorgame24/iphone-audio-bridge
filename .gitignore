@@ -10,6 +10,7 @@ key.pem
 .audio_switcher_state.json
 .airpods_binding.json
 .audio_bridge.log
+.ui_prefs.json
 
 # OS / editor
 .DS_Store
